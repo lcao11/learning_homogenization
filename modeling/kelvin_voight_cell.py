@@ -1,0 +1,661 @@
+import numpy as np
+import ufl
+import dolfin as dl
+import hippylib as hp
+from .utils.visualization import extract_component
+from .utils.projection import Projector
+from .microstructure import MatrixInterpolation
+from .utils.solver_utils import (print_compute_time, LiftingFunction, type_error_message, print_compute_time,
+                               identity_4th, create_mesh)
+import time
+from typing import Any
+
+# 6th-order finite difference coefficients for finite difference estimation of the memory kernel
+coeff_6th_side = np.array([-49 / 20, 6, -15 / 2, 20 / 3, -15 / 4, 6 / 5, -1 / 6])
+coeff_6th_central = np.array([-1 / 60, 3 / 20, -3 / 4, 0, 3 / 4, -3 / 20, 1 / 60])
+coeff_k = [1. / 6, 1. / 3, 1. / 3, 1. / 6]
+coeff_s = [0, 0.5, 0.5, 1.0]
+index_s = [2, 1, 1, 0]
+
+def KelvinVoightSettings():
+    """"
+        Settings for Kelvin Voight Viscoelasticity simulation in unit cell.
+    """
+    settings = {"n_cells": 64,
+                "dim": 2,
+                "FE_order": 1,
+                "direct_solver": True}
+    return settings
+
+
+def _tensor2array_index(d: int) -> np.ndarray:
+    """
+    :param d: the dimension of the cell problem
+    :return: the 2d matrix containing the array index of a symmetric 2nd order tensor
+    """
+    out = np.zeros((d, d)).astype(int)
+    for i in range(d):
+        for j in range(d):
+            if i <= j:
+                row, col = i, j
+            else:
+                row, col = j, i
+            out[i, j] = (2 * d - row) * (row + 1) // 2 - d + col
+    return out
+
+
+def _array2tensor_index(d: int) -> np.ndarray:
+    """
+    :param d: the dimension of the cell problem :return: the 2d matrix containing the array index of a symmetric 2nd
+    order tensor, where the low triangular part is negative
+    """
+    out = np.zeros((d, d)).astype(int)
+    for i in range(d):
+        for j in range(d):
+            row, col = i, j
+            out[i, j] = (2 * d - row) * (row + 1) // 2 - d + col
+    return out
+
+
+def array2tensor_mapping(d: int) -> np.ndarray:
+    """
+    :param d: the dimension of the cell problem
+    :return: the tensor that maps an array to a symmetric tensor
+    """
+    sym_d = int(d * (d + 1) // 2)
+    transform = np.zeros((d, d, sym_d))
+    idx = _tensor2array_index(d)
+    for i in range(d):
+        for j in range(d):
+            transform[i, j, idx[i, j]] = 1.0 if i == j else 0.5
+    return transform
+
+
+def tensor2array_mapping(d: int) -> np.ndarray:
+    """
+    :param d: the dimension of the cell problem
+    :return: the tensor that maps a symmetric tensor to an array
+    """
+    sym_d = int(d * (d + 1) // 2)
+    transform = np.zeros((d, d, sym_d))
+    idx = _array2tensor_index(d)
+    for i in range(d):
+        for j in range(d):
+            transform[i, j, idx[i, j]] = 1.0 if i == j else 0.5
+    return transform
+
+
+def array2tensor(array: np.ndarray, map: np.ndarray, d: int) -> np.ndarray:
+    """
+    :param array: the input array
+    :param map: the map from array to tensor
+    :param d: the dimension of the problem
+    :return: the symmetric tensor corresponding to the array
+    """
+    out = np.einsum("ijk,k->ij", map, array) if d > 1 else np.expand_dims(array, axis=0)
+    return out
+
+
+def _variational_forms(mesh: dl.mesh, sigma_E: ufl.tensors, sigma_nu: ufl.tensors, test: dl.function.argument.Argument,
+                       symmetric_test: bool = False) -> tuple[ufl.Form, ufl.Form]:
+    """
+    A method for producing variational forms that are repeated used in the viscoelastic cell problem.
+    :param sigma_E: an ufl tensor for the elastic stress
+    :param sigma_nu: an ufl tensor for the viscous stress
+    :param test: a test function for stress assembly.
+    :param symmetric_test: a flag for using symmetric part of the test functions. Might need it for averaged stress computation
+    :return: A tuple of dictionary consists of variational forms
+    """
+    dx = dl.Measure('dx', mesh)
+    grad_form = dl.sym(dl.grad(test)) if symmetric_test else dl.grad(test)
+    varf_E = dl.inner(sigma_E, grad_form) * dx
+    varf_nu = dl.inner(sigma_nu, grad_form) * dx
+    return varf_E, varf_nu
+
+
+class KelvinVoightCellProblem:
+    """
+    This is a class for solving Kelvin Voight Viscoelasticity Cell problem:
+
+        Given a pair of elastic (`E`) and viscous (`nu`) material properties and a pair of averaged strain (`ebar`) and strain rate (`rate`) trajectory,
+        solve the cell problem and compute the averaged strain trajectory.
+    """
+
+    def __init__(self, n_cells=100, dim=2, FE_order=1, direct_solver=True) -> None:
+        """
+        :param n_cells: the number cells in each direction for uniform discretization of the cell problem
+        :param dim: the dimension of the cell problem
+        :param FE_order: the order of the FE polynomial interpolation
+        :param direct_solver: true if use direct solver, false if use iterative solver
+        """
+        self._p, self._n_cells, self._dim, self._direct_solver = FE_order, n_cells, dim, direct_solver
+        self._mesh, pbc = create_mesh(dim, n_cells)
+        self._create_spaces(pbc)
+        self._lift = LiftingFunction(self._Vh, self.dim)
+        (self._A_E, self._E, self._nu, self._E_bar, self._nu_bar, self._f_E,
+         self._f_nu, self._rhs_mean, self._solver) = [None] * 9
+        self._projector = Projector(self._Ph, self._Vh)
+        self.parameters = {}
+        self.parameters["solve_for_viscous_stress"] = False
+        self.parameters["verbose"] = False
+        self.parameters["nt"] = 1000
+        self.parameters["T"] = 1.0
+        self.parameters["maximum_iterations"] = 200
+        self.parameters["relative_tolerance"] = 1e-10
+
+    def _create_spaces(self, pbc: object) -> None:
+        """
+        :param pbc: a periodic boundary with methods `inside()` and `map()`.
+        """
+        VCGp = dl.VectorElement("Lagrange", self._mesh.ufl_cell(), self.FE_order)
+        CGp = dl.FiniteElement("Lagrange", self._mesh.ufl_cell(), self.FE_order)
+        R = dl.VectorElement("R", self._mesh.ufl_cell(), 0)
+        ME = dl.MixedElement([VCGp, R])
+        # The mixed space =  periodic space + scalar Lagrange multiplier
+        self._Mh = dl.FunctionSpace(self._mesh, ME, constrained_domain=pbc)
+        self._Vh = dl.FunctionSpace(self._mesh, VCGp)  # Vector
+        self._Sh = dl.FunctionSpace(self._mesh, CGp)  # Scalar
+        self._Ph = dl.FunctionSpace(self._mesh, VCGp, constrained_domain=pbc)  # Periodic Vector
+        self._SPh = dl.FunctionSpace(self._mesh, CGp, constrained_domain=pbc)  # Periodic Scalar
+
+        # Set up helper vectors
+        self._help_rhs = self.generate_vector(type='mixed')
+        self._help_mixed = [self.generate_vector(type='mixed') for i in range(2)]
+        self._help_periodic = self.generate_vector(type='periodic')
+        self._help_free = self.generate_vector(type='free')
+
+    def FunctionSpace(self, type: str = None) -> dl.FunctionSpace:
+        """
+        :param type: type of function space to return
+        :return: requested function space
+        """
+        if type is None or type == "free":
+            return self._Vh
+        elif type == "scalar":
+            return self._Sh
+        elif type == "scalar_periodic":
+            return self._SPh
+        elif type == "periodic":
+            return self._Ph
+        elif type == "mixed":
+            return self._Mh
+        else:
+            raise Exception(type_error_message())
+
+    def generate_vector(self, type: str = None) -> dl.Vector:
+        """
+        :param type: the type of dolfin vector to return
+        :return: requested dolfin vector
+        """
+        if type is None or type == "free":
+            return dl.Function(self._Vh).vector()
+        elif type == "scalar":
+            return dl.Function(self._Sh).vector()
+        elif type == "periodic":
+            return dl.Function(self._Ph).vector()
+        elif type == "scalar_periodic":
+            return dl.Function(self._SPh).vector()
+        elif type == "mixed":
+            return dl.Function(self._Mh).vector()
+        else:
+            raise Exception(type_error_message())
+
+    def _assemble_system(self, E: Any, nu: Any) -> tuple[
+        dl.Matrix, dl.Matrix, list[dl.Vector], list[list[dl.Vector]], list[list[dl.Vector]]]:
+        """
+        :param E: an ufl 4th order tensor for the elastic material property
+        :param nu: an ufl 4th order tensor for the viscous material property
+        :return: matrices and vectors for the system of equations at each time step for the cell problem.
+        """
+        # Compute the step size, fixed unless reassign material
+        dx = dl.Measure('dx', self._mesh)  # Define DoF flag for integration
+        A_lhs, A_E = dl.PETScMatrix(self._Mh.mesh().mpi_comm()), dl.PETScMatrix(
+            self._Mh.mesh().mpi_comm())  # Define PETScMatrix for LHS and RHS for the periodic solution
+        # FEniCS test and trial function, split into periodic and multiplier functions
+        (u_trial, lam_trial) = dl.split(dl.TrialFunction(self._Mh))
+        (u_test, lam_test) = dl.split(dl.TestFunction(self._Mh))
+        eps_trial = dl.sym(dl.grad(u_trial))  # The strain trial function
+        i, j, k, l = ufl.indices(4)  # The indices for 4th order tensor
+        # The viscous and elastic stress trial function
+        sigma_E = ufl.as_tensor(E[i, j, k, l] * eps_trial[k, l], (i, j))
+        sigma_nu = ufl.as_tensor(nu[i, j, k, l] * eps_trial[k, l], (i, j))
+        # Getting variational forms for LHS and RHS matrix
+        varf_E, varf_nu = _variational_forms(self._mesh, sigma_E, sigma_nu, u_test)
+        # The LHS matrix of the variational form, RK4
+        varf_lhs = varf_nu + dl.inner(lam_trial, u_test) * dx + dl.inner(u_trial, lam_test) * dx
+        dl.assemble(varf_lhs, tensor=A_lhs)
+        dl.assemble(varf_E, tensor=A_E)  # The matrix A_E
+        # The RHS vectors of the variational form:
+        rhs_mean = [None for ii in range(self.dim)]  # The mean constraint
+        f_E = [[None for ii in range(self.dim)] for jj in range(self.dim)]  # The vectors for ebar
+        f_nu = [[None for ii in range(self.dim)] for jj in range(self.dim)]  # The vector for rate
+        for ii in range(self.dim):
+            # We assemble the RHS vector for the mean constraint
+            one_half = [0.0 for ii in range(self.dim)]
+            one_half[ii] = 0.5
+            rhs_mean[ii] = dl.assemble(dl.inner(-dl.Constant(one_half), lam_test) * dx)
+            # We assemble the RHS vector for ebar and rate
+            for jj in range(self.dim):
+                sigma_E = ufl.as_tensor(E[ii, jj, i, j], (i, j))
+                sigma_nu = ufl.as_tensor(nu[ii, jj, i, j], (i, j))
+                varf_E, varf_nu = _variational_forms(self._mesh, sigma_E, sigma_nu, u_test, symmetric_test=True)
+                f_E[ii][jj] = dl.assemble(varf_E)
+                f_nu[ii][jj] = dl.assemble(varf_nu)
+        return A_lhs, A_E, rhs_mean, f_E, f_nu
+
+    def _assemble_stress_map(self, E: ufl.tensors, nu: ufl.tensors) -> tuple[np.ndarray, np.ndarray]:
+        """
+        :param E: an ufl tensor
+        :param nu: an ufl tensor
+        :return: the spatial mean of E and nu components
+        """
+        dx = dl.Measure('dx', self._mesh)
+        E_bar = np.zeros((self.dim, self.dim, self.dim, self.dim))
+        nu_bar = np.zeros((self.dim, self.dim, self.dim, self.dim))
+        u_test, _ = dl.split(dl.TestFunction(self._Mh))
+        for ii in range(self.dim):
+            for jj in range(self.dim):
+                for kk in range(self.dim):
+                    for ll in range(self.dim):
+                        # Assemble the 4th order tensor for stress caused by strain and strain rate
+                        E_bar[ii, jj, kk, ll] = dl.assemble(E[ii, jj, kk, ll] * dx)
+                        nu_bar[ii, jj, kk, ll] = dl.assemble(nu[ii, jj, kk, ll] * dx)
+        return E_bar, nu_bar
+
+    def _assemble_rhs(self, z, strain, rate):
+        """
+        This function assemble the rhs matrix for RK4 scheme.
+        :param z: the current state vector
+        :param strain: the 3-point stencil values of strain tensor
+        :param rate: the 3-point stencil values of strain rate tensor
+        """
+
+        self._help_rhs.zero()
+        self._help_mixed[1].zero()
+        for ii in range(self.dim):
+            for jj in range(self.dim):
+                self._help_rhs.axpy(strain[0, ii, jj] - strain[-1, ii, jj], self._rhs_mean[ii])
+        for step in range(4):
+            self._help_mixed[0].zero()
+            self._help_mixed[0].axpy(-1, self._A_E * z)
+            self._help_mixed[0].axpy(-coeff_s[step] * self.dt, self._A_E * self._help_mixed[1])
+            for ii in range(self.dim):
+                for jj in range(self.dim):
+                    self._help_mixed[0].axpy(-strain[index_s[step], ii, jj], self._f_E[ii][jj])
+                    self._help_mixed[0].axpy(-rate[index_s[step], ii, jj], self._f_nu[ii][jj])
+            self._help_rhs.axpy(coeff_k[step] * self.dt, self._help_mixed[0])
+            self._help_mixed[1].zero()
+            self._help_mixed[1].axpy(1., self._help_mixed[0])
+
+    def set_material(self, E: Any, nu: Any) -> None:
+        """
+        :param E: the elastic material
+        :param nu: the viscous material
+        The materials must be given as one the following type:
+        (1) dolfin vectors; (2) matrices; (3) functions; (4) an ufl matrix
+        """
+        material = [None] * 2
+        error_message = ("The size of the matrix does not match the scalar free function space nor the scalar periodic"
+                         "function space")
+        for count, arg in enumerate([E, nu]):
+            if isinstance(arg, dl.cpp.la.PETScVector):
+                if arg.size() == self._Sh.dim():
+                    func = hp.vector2Function(arg, self._Sh)
+                elif arg.size() == self._SPh.dim():
+                    func = hp.vector2Function(arg, self._SPh)
+                else:
+                    raise Exception(error_message)
+                material[count] = func * identity_4th(self.dim)
+            elif isinstance(arg, np.ndarray):
+                assert self.FE_order == 1
+                if arg.size == self._Sh.dim():
+                    func = MatrixInterpolation(arg, self._Sh)
+                elif arg.size == self._SPh.dim():
+                    func = MatrixInterpolation(arg, self._SPh)
+                else:
+                    raise Exception(error_message)
+                material[count] = func * identity_4th(self.dim)
+            elif isinstance(arg, dl.function.function.Function) or isinstance(arg, dl.function.constant.Constant):
+                material[count] = arg * identity_4th(self.dim)
+            else:
+                material[count] = arg
+        time0 = None
+        if self.parameters["verbose"]:
+            print("Assemble required matrices and vectors....")
+            time0 = time.time()
+        A_lhs, self._A_E, self._rhs_mean, self._f_E, self._f_nu = self._assemble_system(material[0], material[1])
+        self._E_bar, self._nu_bar = self._assemble_stress_map(material[0], material[1])
+        if self.dim == 3:
+            if self.use_direct_solver:
+                self._solver = hp.PETScLUSolver(self._Mh.mesh().mpi_comm(), method="mumps")
+            else:
+                self._solver = hp.PETScKrylovSolver(self._Mh.mesh().mpi_comm(), "gmres", "jacobi")
+                self._solver.parameters["maximum_iterations"] = self.parameters["maximum_iterations"]
+                self._solver.parameters["relative_tolerance"] = self.parameters["relative_tolerance"]
+                self._solver.parameters["error_on_nonconvergence"] = True
+                self._solver.parameters["nonzero_initial_guess"] = False
+        else:
+            self._solver = hp.PETScLUSolver(self._Mh.mesh().mpi_comm())
+        self._solver.set_operator(A_lhs)
+        if self.parameters["verbose"]:
+            time1 = time.time()
+            print("Finished. Took %1.2fs" % (time1 - time0))
+        self._E, self._nu = material[0], material[1]
+
+    def _update_stress(self, stress: np.ndarray, step_count: int, sigma_E: np.ndarray, sigma_nu: np.ndarray,
+                       strain: np.ndarray, rate: np.ndarray) -> None:
+        """
+        :param stress: a numpy array for stress history.
+        :param step_count: an integer for step count, with t=0 has count 0.
+        :param sigma_E: a numpy ndarray for elastic stress component for the periodic solution
+        :param sigma_nu: a numpy ndarray for viscous stress component for the periodic solution
+        :param strain: a numpy ndarray for the symmetric tensor form of strain history (up to 5 steps)
+        :param rate: a numpy ndarray for the symmetric tensor form of strain rate history (up to 5 steps)
+        """
+        # 6nd-order Forward difference approximation of the stress at 1st and 2nd point
+        if 6 <= step_count <= 8:
+            coeff = coeff_6th_side[::-1, np.newaxis, np.newaxis]
+            offset, current = 6, -1
+            stress[step_count - offset] = np.sum(coeff / self.dt * sigma_nu, axis=0) + sigma_E[current] \
+                                          + np.einsum('ijkl,kl->ij', self._E_bar, strain[current]) + \
+                                          np.einsum('ijkl,kl->ij', self._nu_bar, rate[current])
+        # 6nd-order Backward difference approximation of the stress at two last points
+        if step_count >= self.nt - 2:
+            coeff = -coeff_6th_side[:, np.newaxis, np.newaxis]
+            offset, current = 0, 0
+            stress[step_count - offset] = np.sum(coeff / self.dt * sigma_nu, axis=0) + sigma_E[current] \
+                                          + np.einsum('ijkl,kl->ij', self._E_bar, strain[current]) + \
+                                          np.einsum('ijkl,kl->ij', self._nu_bar, rate[current])
+        if step_count >= 6:  # 6nd-order central difference
+            coeff = coeff_6th_central[::-1, np.newaxis, np.newaxis]
+            offset, current = 3, 3
+            stress[step_count - offset] = np.sum(coeff / self.dt * sigma_nu, axis=0) + sigma_E[current] \
+                                          + np.einsum('ijkl,kl->ij', self._E_bar, strain[current]) + \
+                                          np.einsum('ijkl,kl->ij', self._nu_bar, rate[current])
+
+    def _assign_displacement(self, displacement: dl.Vector, periodic: dl.Vector, strain: np.ndarray) -> None:
+        """
+        This function takes in periodic deviation and strain tensor and return a displacement vector
+        :param displacement: the displacement vector that will be assigned the displacement values
+        :param periodic: the periodic vector
+        :param strain: the strain at the given periodic function
+        """
+        temp = self._projector.project(periodic)
+        varepsilon = self._lift.generate(strain)
+        displacement.zero()
+        displacement.axpy(1., temp.vector())
+        displacement.axpy(1., varepsilon)
+
+    def _solve_for_stress(self, z, strain, rate, compute_memory=False):
+        """
+        :param z: The current state vector
+        :param strain: the current strain tensor of size dim x dim
+        :param rate: the current strain rate tensor of size dim x dim
+        :param compute_memory: True to compute first and second order rate of change of stress
+        :return: the stress and/or stress rate array.
+        """
+        self._help_rhs.zero()
+        self._help_rhs.axpy(-1., self._A_E * z)
+        for ii in range(self.dim):
+            for jj in range(self.dim):
+                self._help_rhs.axpy(rate[ii, jj], self._rhs_mean[ii])
+        for ii in range(self.dim):
+            for jj in range(self.dim):
+                self._help_rhs.axpy(-strain[ii, jj], self._f_E[ii][jj])
+                self._help_rhs.axpy(-rate[ii, jj], self._f_nu[ii][jj])
+        self._solver.solve(self._help_mixed[0], self._help_rhs)
+        stress = np.einsum('ijkl,kl->ij', self._E_bar, strain) + np.einsum('ijkl,kl->ij', self._nu_bar, rate)
+        for ii in range(self.dim):
+            for jj in range(self.dim):
+                stress[ii, jj] += self._f_E[ii][jj].inner(z)
+                stress[ii, jj] += self._f_nu[ii][jj].inner(self._help_mixed[0])
+        if not compute_memory:
+            return stress
+        else:
+            self._help_rhs.zero()
+            self._help_rhs.axpy(-1., self._A_E * self._help_mixed[0])
+            for ii in range(self.dim):
+                for jj in range(self.dim):
+                    self._help_rhs.axpy(-rate[ii, jj], self._f_E[ii][jj])
+            self._solver.solve(self._help_mixed[1], self._help_rhs)
+            stress_rate_1 = np.einsum('ijkl,kl->ij', self._E_bar, rate)
+            for ii in range(self.dim):
+                for jj in range(self.dim):
+                    stress_rate_1[ii, jj] += self._f_E[ii][jj].inner(self._help_mixed[0])
+                    stress_rate_1[ii, jj] += self._f_nu[ii][jj].inner(self._help_mixed[1])
+            self._help_rhs.zero()
+            self._help_rhs.axpy(-1., self._A_E * self._help_mixed[1])
+            self._solver.solve(self._help_mixed[0], self._help_rhs)
+            stress_rate_2 = np.zeros((self.dim, self.dim))
+            for ii in range(self.dim):
+                for jj in range(self.dim):
+                    stress_rate_2[ii, jj] += self._f_E[ii][jj].inner(self._help_mixed[1])
+                    stress_rate_2[ii, jj] += self._f_nu[ii][jj].inner(self._help_mixed[0])
+            return stress, stress_rate_1, stress_rate_2
+
+    def extract_memory_form(self):
+        """
+        This function extract component of the memory form homogenized model. In particular, the memory form is given by
+            s(t) = E'e(t) + nu'\dot{e}(t) + \int_0^t K(t-s) e(s) ds
+        :return: stress, stress 1st order rate of change, and stress 2nd order rate of change
+        """
+        time1, time2 = None, None
+        if self.parameters["verbose"]:
+            time1 = time.time()
+            print("Solving for stress and stress rate of changes for unit strain rate trajectories...")
+        t2a_map = tensor2array_mapping(self.dim)
+        times = np.linspace(0, self.T, self.nt + 1)
+        stress = np.zeros((self.nt + 1, self.d_sym, self.dim, self.dim))
+        stress_rate_1 = np.zeros((self.nt + 1, self.d_sym, self.dim, self.dim))
+        stress_rate_2 = np.zeros((self.nt + 1, self.d_sym, self.dim, self.dim))
+        a2t_map = array2tensor_mapping(self.dim)
+        z = self.generate_vector(type="mixed")
+        for ii in range(self.d_sym):
+            strain = np.zeros((3, self.dim, self.dim))
+            rate = np.repeat(np.expand_dims(a2t_map[:, :, ii], axis=0), 3, axis=0)
+            z.zero()
+            for step_count, t in enumerate(times):
+                for jj in range(3):
+                    strain[jj] = (t + (1 - 0.5 * jj) * self.dt) * a2t_map[:, :, ii]
+                stress[step_count, ii], stress_rate_1[step_count, ii], stress_rate_2[step_count, ii] = self._solve_for_stress(z, strain[-1], rate[-1],compute_memory=True)
+                if step_count < self.nt:
+                    self._assemble_rhs(z, strain, rate)
+                    self._solver.solve(self._help_mixed[0], self._help_rhs)
+                    z.axpy(1., self._help_mixed[0])
+        if self.parameters["verbose"]:
+            time2 = time.time()
+            print("Total time: %1.2fs"%(time2-time1))
+
+        return np.einsum("ijkl, klm -> ijm", stress, t2a_map), np.einsum("ijkl, klm -> ijm", stress_rate_1,
+                                                                         t2a_map), np.einsum("ijkl, klm -> ijm",
+                                                                                             stress_rate_2, t2a_map)
+
+    def solve(self, strain_func: Any, rate_func: Any, return_displacement: bool = False, return_periodic: bool = False,
+              file: dl.File = None, snapshots: list[int, ...] = None) -> (tuple[np.ndarray,
+    np.ndarray, list[dl.Vector, ...], list[dl.Vector, ...]] |
+                                                                          tuple[Any, Any, list[dl.Vector, ...]] |
+                                                                          tuple[np.ndarray, np.ndarray]):
+        """
+
+        :param strain_func: A time series that returns a 2d numpy array of size d*(d+1)/2 when called at any [0, T]
+        :param rate_func: A time series that returns a 2d numpy array of size d*(d+1)/2 when called at any [0, T]
+        :param return_displacement: A flag for returning displacement as a list of dolfin vectors. Default to `False`
+        :param return_periodic: A flag for returning periodic part of the displacement as a list of dolfin vectors. Default to `False`.
+        :param file: the pvd file for saving the solution state
+        :param snapshots: the numpy array for the time slices requested for return or saving the state evolution.
+        :return: A numpy array of size (nt + 1, d*(d+1)/2) for the stress evolution at discrete time position, where d is the dimension of the problem.
+        """
+
+        clock_ebar, clock_solve, clock_stress = None, None, None
+        if return_displacement and self.parameters["verbose"]:
+            print("Computing displacement is done via L2 project and it can be slow.")
+        solve_time, stress_time, ebar_time, time0 = 0, 0, 0, 0
+        displacement_time = 0 if return_displacement else None
+        if self.parameters["verbose"]:
+            print("Solving the cell problem....")
+            time0 = time.time()
+
+        # Initialize mappings between symmetric 2nd order tensor and reduced array
+        a2t_map = array2tensor_mapping(self.dim)
+        t2a_map = tensor2array_mapping(self.dim)
+
+        times = np.linspace(0, self.T, self.nt + 1)
+        stress = np.zeros((self.nt + 1, self.dim, self.dim))
+
+        # Storage for ebar and rate for 5 time steps
+        strain_hist = np.zeros((7, self.dim, self.dim))
+        rate_hist = np.zeros((7, self.dim, self.dim))
+
+        # Ebar for RK4 RHS evalautions
+        strain_stencil = np.zeros((3, self.dim, self.dim))
+        rate_stencil = np.zeros((3, self.dim, self.dim))
+
+        # storage for PDE solutions
+        z = self.generate_vector(type="mixed")
+        # Storage of averaged stress for periodic solution for 5 time steps
+        sigma_E_hist = np.zeros((7, self.dim, self.dim))
+        sigma_nu_hist = np.zeros((7, self.dim, self.dim))
+
+        # Initialize strain and strain rate
+        strain = strain_func(0.0)
+        assert strain.size == self.d_sym
+        strain_hist[1] = array2tensor(strain, a2t_map, self.dim)
+        rate = rate_func(0.0)
+        assert rate.size == self.d_sym
+        rate_hist[1] = array2tensor(rate, a2t_map, self.dim)
+        if self.parameters["solve_for_viscous_stress"]:
+            stress[0] = self._solve_for_stress(z, strain_hist[1], rate_hist[1], compute_memory=False)
+
+        # Initialize output time series
+        u_list, u_p_list = [], []
+
+        if snapshots is None or np.isin(0, snapshots).all():
+            if file is None:
+                if return_displacement: u_list.append(self.generate_vector("free"))
+                if return_periodic: u_p_list.append(self.generate_vector("periodic"))
+            else:
+                if return_displacement: file.write(dl.Function(self._Vh), 0.0)
+                if return_periodic: file.write(dl.Function(self._Ph), 0.0)
+
+        # Loop through nt steps
+        for step_count, t in enumerate(times[1:]):
+            clock_new_iter = time.time() if self.parameters["verbose"] else None
+            # Evaluate strain and strain rate
+            strain_hist[0] = array2tensor(strain_func(t), a2t_map, self.dim)
+            rate_hist[0] = array2tensor(rate_func(t), a2t_map, self.dim)
+
+            strain_stencil[0] = strain_hist[0]
+            rate_stencil[0] = rate_hist[0]
+            strain_stencil[1] = array2tensor(strain_func(t - 0.5 * self.dt), a2t_map, self.dim)
+            rate_stencil[1] = array2tensor(rate_func(t - 0.5 * self.dt), a2t_map, self.dim)
+            strain_stencil[2] = strain_hist[1]
+            rate_stencil[2] = rate_hist[1]
+
+            if self.parameters["verbose"]:
+                clock_ebar = time.time()
+                ebar_time += clock_ebar - clock_new_iter
+
+            self._assemble_rhs(z, strain_stencil, rate_stencil)  # Compute RHS vector
+            self._solver.solve(self._help_mixed[0], self._help_rhs)  # the update from previous time to current time
+            z.axpy(1., self._help_mixed[0])
+
+            if self.parameters["verbose"]:
+                clock_solve = time.time()
+                solve_time += clock_solve - clock_ebar
+            # Compute the stress components for the periodic solution
+            if not self.parameters["solve_for_viscous_stress"]:
+                for ii in range(self.dim):
+                    for jj in range(self.dim):
+                        sigma_E_hist[0, ii, jj] = self._f_E[ii][jj].inner(z)
+                        sigma_nu_hist[0, ii, jj] = self._f_nu[ii][jj].inner(z)
+                    # Update the stress trajectory
+                self._update_stress(stress, step_count + 1, sigma_E_hist, sigma_nu_hist, strain_hist, rate_hist)
+            else:
+                stress[step_count + 1] = self._solve_for_stress(z, strain_hist[0], rate_hist[0], compute_memory=False)
+
+            if self.parameters["verbose"]:
+                clock_stress = time.time()
+                stress_time += clock_stress - clock_solve
+
+            if snapshots is None or np.isin(step_count + 1, snapshots).all():
+                if return_displacement:
+                    extract_component(self._help_periodic, z, self._Ph, self._Mh, component=0)
+                    if file is None:
+                        u_list.append(self.generate_vector("free"))
+                        self._assign_displacement(u_list[-1], self._help_periodic, strain_hist[0])
+                    else:
+                        self._assign_displacement(self._help_free, self._help_periodic, strain_hist[0])
+                        file.write(hp.vector2Function(self._help_free, self._Vh), t)
+                    if self.parameters["verbose"]:
+                        clock_displacement = time.time()
+                        displacement_time += clock_displacement - clock_stress
+                if return_periodic:
+                    if file is None:
+                        u_p_list.append(self.generate_vector("periodic"))
+                        extract_component(u_p_list[-1], z, self._Ph, self._Mh, component=0)
+                    else:
+                        extract_component(self._help_periodic, z, self._Ph, self._Mh, component=0)
+                        file.write(hp.vector2Function(self._help_periodic, self._Ph), t)
+
+            strain_hist[1:] = strain_hist[:-1]
+            rate_hist[1:] = rate_hist[:-1]
+            sigma_E_hist[1:] = sigma_E_hist[:-1]
+            sigma_nu_hist[1:] = sigma_nu_hist[:-1]
+
+        if file is not None:
+            file.close()
+
+        out = np.einsum("ijk, jkl -> il", stress, t2a_map)
+        if self.parameters["verbose"]:
+            time1 = time.time()
+            print_compute_time(time1 - time0, [solve_time, stress_time, ebar_time, displacement_time],
+                               label=["Solve", "Stress estimation", "Ebar and rate evaluation",
+                                      "Solution to displacement mapping"])
+        if return_displacement and return_periodic and file is None:
+            return times, out, u_list, u_p_list
+        elif return_displacement and file is None:
+            return times, out, u_list
+        elif return_periodic and file is None:
+            return times, out, u_p_list
+        else:
+            return times, out
+
+    @property
+    def E(self):
+        return self._E
+
+    @property
+    def nu(self):
+        return self._nu
+
+    @property
+    def T(self):
+        return self.parameters["T"]
+
+    @property
+    def nt(self):
+        return self.parameters["nt"]
+
+    @property
+    def dt(self):
+        return self.parameters["T"] / self.parameters["nt"]
+
+    @property
+    def dim(self):
+        return self._dim
+
+    @property
+    def d_sym(self):
+        return self.dim * (self.dim + 1) // 2
+
+    @property
+    def n_cells(self):
+        return self._n_cells
+
+    @property
+    def FE_order(self):
+        return self._p
+
+    @property
+    def use_direct_solver(self):
+        return self._direct_solver
