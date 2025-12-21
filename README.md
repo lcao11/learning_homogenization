@@ -2,10 +2,14 @@
 
 Learn memory- and microstructure-dependnet constitutive models from cell-problem simulations (FEniCS/hIPPYlib), then use neural constitutive surrogates (PyTorch) for fast evaluation and (for KV) macro-scale comparisons.
 
+See the arXiv preprint: [arXiv:2502.05463](https://arxiv.org/abs/2502.05463) (DOI: 10.48550/arXiv.2502.05463)
+
 This repo currently contains two main 1D problem families:
 
 - KV 1D (Kelvin–Voigt viscoelasticity): generates strain/strain-rate/stress trajectories and (optionally) a memory-kernel representation; trains a recurrent neural operator-style surrogate; includes a macroscale benchmark comparing homogenized-memory vs multiscale vs neural surrogate.
 - EVP 1D (elasto-viscoplasticity): generates strain/stress trajectories for random microstructures; trains a surrogate.
+
+The repo additionally contain KV 2D and 3D solver, which is thoroughly tested but the tutorial is not included yet.
 
 ## Quickstart
 
