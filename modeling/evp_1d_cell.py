@@ -62,15 +62,15 @@ class ElastoViscoplasticity1DCellProblem:
         else:
             raise Exception(type_error_message())
 
-    def set_material(self, youngs_modulus: Any, rate_constant: Any, yield_stress: Any, rate_exponent: Any) -> None:
+    def set_microstructure(self, youngs_modulus: Any, rate_constant: Any, yield_stress: Any, rate_exponent: Any) -> None:
         """
-        The materials must be given as one the following type:
+        The microstructures must be given as one the following type:
         (1) dolfin vectors; (2) matrices; (3) functions; (4) an ufl matrix
         """
-        material = [youngs_modulus, rate_constant, yield_stress, rate_exponent]
+        microstructure = [youngs_modulus, rate_constant, yield_stress, rate_exponent]
         error_message = ("The size of the matrix does not match the free function space nor the periodic"
                          "function space")
-        for count, arg in enumerate(material):
+        for count, arg in enumerate(microstructure):
             if isinstance(arg, dl.cpp.la.PETScVector):
                 if arg.size() == self._Vh.dim():
                     func = hp.vector2Function(arg, self._Vh)
@@ -78,7 +78,7 @@ class ElastoViscoplasticity1DCellProblem:
                     func = hp.vector2Function(arg, self._Ph)
                 else:
                     raise Exception(error_message)
-                material[count] = func
+                microstructure[count] = func
             elif isinstance(arg, np.ndarray):
                 assert self.FE_order == 1
                 if arg.size == self._Vh.dim():
@@ -87,10 +87,10 @@ class ElastoViscoplasticity1DCellProblem:
                     func = MatrixInterpolation(arg, self._Ph)
                 else:
                     raise Exception(error_message)
-                material[count] = func
+                microstructure[count] = func
             else:
-                material[count] = arg
-        self._youngs_modulus, self._rate_constant, self._yield_stress, self._rate_exponent = material[0], material[1], material[2], material[3]
+                microstructure[count] = arg
+        self._youngs_modulus, self._rate_constant, self._yield_stress, self._rate_exponent = microstructure[0], microstructure[1], microstructure[2], microstructure[3]
         self._E_inv_mean = dl.assemble(1./self._youngs_modulus*dl.dx)
     
     def solve(self, strain_func: Any) -> tuple[np.ndarray, np.ndarray, np.ndarray]:

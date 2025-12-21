@@ -117,7 +117,7 @@ class KelvinVoightCellProblem:
     """
     This is a class for solving Kelvin Voight Viscoelasticity Cell problem:
 
-        Given a pair of elastic (`E`) and viscous (`nu`) material properties and a pair of averaged strain (`ebar`) and strain rate (`rate`) trajectory,
+        Given a pair of elastic (`E`) and viscous (`nu`) microstructure properties and a pair of averaged strain (`ebar`) and strain rate (`rate`) trajectory,
         solve the cell problem and compute the averaged strain trajectory.
     """
 
@@ -203,11 +203,11 @@ class KelvinVoightCellProblem:
     def _assemble_system(self, E: Any, nu: Any) -> tuple[
         dl.Matrix, dl.Matrix, list[dl.Vector], list[list[dl.Vector]], list[list[dl.Vector]]]:
         """
-        :param E: an ufl 4th order tensor for the elastic material property
-        :param nu: an ufl 4th order tensor for the viscous material property
+        :param E: an ufl 4th order tensor for the elastic microstructure property
+        :param nu: an ufl 4th order tensor for the viscous microstructure property
         :return: matrices and vectors for the system of equations at each time step for the cell problem.
         """
-        # Compute the step size, fixed unless reassign material
+        # Compute the step size, fixed unless reassign microstructure
         dx = dl.Measure('dx', self._mesh)  # Define DoF flag for integration
         A_lhs, A_E = dl.PETScMatrix(self._Mh.mesh().mpi_comm()), dl.PETScMatrix(
             self._Mh.mesh().mpi_comm())  # Define PETScMatrix for LHS and RHS for the periodic solution
@@ -287,14 +287,14 @@ class KelvinVoightCellProblem:
             self._help_mixed[1].zero()
             self._help_mixed[1].axpy(1., self._help_mixed[0])
 
-    def set_material(self, E: Any, nu: Any) -> None:
+    def set_microstructure(self, E: Any, nu: Any) -> None:
         """
-        :param E: the elastic material
-        :param nu: the viscous material
-        The materials must be given as one the following type:
+        :param E: the microstructure elastic property
+        :param nu: the microstructure viscous property
+        The microstructures must be given as one the following type:
         (1) dolfin vectors; (2) matrices; (3) functions; (4) an ufl matrix
         """
-        material = [None] * 2
+        microstructure = [None] * 2
         error_message = ("The size of the matrix does not match the scalar free function space nor the scalar periodic"
                          "function space")
         for count, arg in enumerate([E, nu]):
@@ -305,7 +305,7 @@ class KelvinVoightCellProblem:
                     func = hp.vector2Function(arg, self._SPh)
                 else:
                     raise Exception(error_message)
-                material[count] = func * identity_4th(self.dim)
+                microstructure[count] = func * identity_4th(self.dim)
             elif isinstance(arg, np.ndarray):
                 assert self.FE_order == 1
                 if arg.size == self._Sh.dim():
@@ -314,17 +314,17 @@ class KelvinVoightCellProblem:
                     func = MatrixInterpolation(arg, self._SPh)
                 else:
                     raise Exception(error_message)
-                material[count] = func * identity_4th(self.dim)
+                microstructure[count] = func * identity_4th(self.dim)
             elif isinstance(arg, dl.function.function.Function) or isinstance(arg, dl.function.constant.Constant):
-                material[count] = arg * identity_4th(self.dim)
+                microstructure[count] = arg * identity_4th(self.dim)
             else:
-                material[count] = arg
+                microstructure[count] = arg
         time0 = None
         if self.parameters["verbose"]:
             print("Assemble required matrices and vectors....")
             time0 = time.time()
-        A_lhs, self._A_E, self._rhs_mean, self._f_E, self._f_nu = self._assemble_system(material[0], material[1])
-        self._E_bar, self._nu_bar = self._assemble_stress_map(material[0], material[1])
+        A_lhs, self._A_E, self._rhs_mean, self._f_E, self._f_nu = self._assemble_system(microstructure[0], microstructure[1])
+        self._E_bar, self._nu_bar = self._assemble_stress_map(microstructure[0], microstructure[1])
         if self.dim == 3:
             if self.use_direct_solver:
                 self._solver = hp.PETScLUSolver(self._Mh.mesh().mpi_comm(), method="mumps")
@@ -340,7 +340,7 @@ class KelvinVoightCellProblem:
         if self.parameters["verbose"]:
             time1 = time.time()
             print("Finished. Took %1.2fs" % (time1 - time0))
-        self._E, self._nu = material[0], material[1]
+        self._E, self._nu = microstructure[0], microstructure[1]
 
     def _update_stress(self, stress: np.ndarray, step_count: int, sigma_E: np.ndarray, sigma_nu: np.ndarray,
                        strain: np.ndarray, rate: np.ndarray) -> None:

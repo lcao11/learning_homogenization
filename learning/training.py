@@ -91,7 +91,8 @@ def train_constitutive_model(models: list[torch.nn.Module],
                                        torch.utils.data.DataLoader, torch.utils.data.DataLoader],
                                    loss_function: torch.nn.Module, times: torch.Tensor, n_internal: int,
                                    output_path: str, lr: float = 1e-3, epochs: int = 1000,
-                                   verbose: bool = True, rate_explicit: bool = True) -> None:
+                                   verbose: bool = True, rate_explicit: bool = True,
+                                   grad_clip_norm: float = 1.0) -> None:
     """
     :param models: a list of models in the order of model_F (stress output) and model_G (internal variable rate output)
     :param data: a tuple of training and validation data loader
@@ -103,12 +104,14 @@ def train_constitutive_model(models: list[torch.nn.Module],
     :param output_path: the output path for saving results
     :param verbose: whether to print loss evolutions
     :param rate_explicit: whether to use explicit strain rate as model input
+    :param grad_clip_norm: clip gradient global norm to this value (set <= 0 to disable)
     :return:
     """
     train_losses = []
     valid_losses = []
 
-    optimizer = torch.optim.Adam(list(models[0].parameters()) + list(models[1].parameters()), lr=lr)
+    all_params = list(models[0].parameters()) + list(models[1].parameters())
+    optimizer = torch.optim.Adam(all_params, lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, epochs, 1e-6)
 
     device = check_device()
@@ -150,6 +153,12 @@ def train_constitutive_model(models: list[torch.nn.Module],
                 loss = loss_function(stress_approx, stress)
             
             loss.backward()
+
+            if grad_clip_norm > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    all_params,
+                    max_norm=grad_clip_norm,
+                )
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
                 

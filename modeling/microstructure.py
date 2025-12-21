@@ -95,22 +95,22 @@ class Ellipse(dl.UserExpression):
         return ()
 
 
-def EllipseMaterial(Vh: dl.FunctionSpace, center=None, matrix=None, values=None):
+def EllipseMicrostructure(Vh: dl.FunctionSpace, center=None, matrix=None, values=None):
     assert len(center) == Vh.mesh().geometric_dimension()
     assert len(values) == 2
     assert matrix.shape[0] == matrix.shape[1] and matrix.shape[0] == Vh.mesh().geometric_dimension()
     if isinstance(center, list):
         center = np.array(center)
     inv = np.linalg.inv(matrix)
-    material_init = Ellipse(center, inv, values, degree=3)
-    material = dl.Function(Vh)
-    material.interpolate(material_init)
-    return material.vector()
+    microstructure_init = Ellipse(center, inv, values, degree=3)
+    microstructure = dl.Function(Vh)
+    microstructure.interpolate(microstructure_init)
+    return microstructure.vector()
 
 
-class RandomMaterial:
+class RandomMicrostructure:
     """
-    This is a class that can be used to generate random field material properties. The material is represented as `E(
+    This is a class that can be used to generate random field microstructure properties. The microstructure is represented as `E(
     x) = (a-b)*(erf(s(x)) + 1)/2 + b`, where a and b are the upper and lower bound, and s is a Gaussian random field
     with bi-Laplacian inverse covariance and robin boundary.
     """
@@ -120,7 +120,7 @@ class RandomMaterial:
                  anisotropic_scalings: [float, ...] = None, mean: Any = None, max_iter: int = 500,
                  rel_tol: float = 1.e-10):
         """
-        :param Vh: the material function space
+        :param Vh: the microstructure function space
         :param bound: a list of the lower and upper bounds
         :param correlation_length: the spatial correlation length for the Gaussian random field
         :param pointwise_std: a pointwise standard deviation for the Gaussian random field
@@ -195,9 +195,9 @@ class RandomMaterial:
         hp.parRandom.normal(1., self._noise)
 
 
-class PeriodicRandomMaterial(RandomMaterial):
+class PeriodicRandomMicrostructure(RandomMicrostructure):
     """
-    This is a class that can be used to generate periodic random field material properties. The material is
+    This is a class that can be used to generate periodic random field microstructure properties. The microstructure is
     represented as `E(x) = (a-b)*(erf(s(x)) + 1)/2 + b`, where a and b are the upper and lower bound, and s is a
     periodic Gaussian random field with bi-Laplacian inverse covariance and periodic boundaries.
     """
@@ -206,13 +206,13 @@ class PeriodicRandomMaterial(RandomMaterial):
                  pointwise_std: float = 0.5, anisotropic_angles: [float, ...] = None,
                  anisotropic_scalings: [float, ...] = None, mean: Any = None,
                  max_iter: int = 500, rel_tol: float = 1.e-10) -> None:
-        super(PeriodicRandomMaterial, self).__init__(Vh, bound=bound, correlation_length=correlation_length,
+        super(PeriodicRandomMicrostructure, self).__init__(Vh, bound=bound, correlation_length=correlation_length,
                                                      pointwise_std=pointwise_std, anisotropic_angles=anisotropic_angles,
                                                      anisotropic_scalings=anisotropic_scalings, mean=mean,
                                                      max_iter=max_iter,
                                                      rel_tol=rel_tol)
         """
-        :param Vh: the material function space
+        :param Vh: the microstructure function space
         :param bound: a list of the lower and upper bounds
         :param correlation_length: the spatial correlation length for the Gaussian random field
         :param pointwise_std: a pointwise standard deviation for the Gaussian random field
@@ -267,7 +267,7 @@ class PeriodicRandomMaterial(RandomMaterial):
 
 class PC1D(dl.UserExpression):
     """
-    A dolfin expression for interpolating a 1D piecewise constant material with given discontinuity points and values
+    A dolfin expression for interpolating a 1D piecewise constant microstructure with given discontinuity points and values
     """
 
     def __init__(self, points, values, degree, periodic):
@@ -275,7 +275,7 @@ class PC1D(dl.UserExpression):
         :param points: the discontinuity points, must be sorted
         :param values: the piecewise constant values, must be sorted
         :param degree: the finite element polynomial degree for interpolation
-        :param periodic: whether to the material is periodic. Default is True.
+        :param periodic: whether to the microstructure is periodic. Default is True.
         """
         self._points = points
         self._values = values
@@ -297,16 +297,16 @@ class PC1D(dl.UserExpression):
         return ()
 
 
-def PC1DMaterial(Vh: dl.FunctionSpace, points: np.ndarray, values: np.ndarray, periodic: bool = True,
+def PC1DMicrostructure(Vh: dl.FunctionSpace, points: np.ndarray, values: np.ndarray, periodic: bool = True,
                  degree: int = 3) -> dl.cpp.la.PETScVector:
     """
-    A function for generating piecewise constant material in 1D
+    A function for generating piecewise constant microstructure in 1D
     :param Vh: the function space intended for interpolation. Must be a scalar function space
     :param points: the discontinuity points. The points must be sorted from 0 to 1
     :param values: the values of the piecewise constant function. The values are assign to pieces starting from left to right
-    :param periodic: whether to return a piecewise constant material
-    :param degree: the degree of material interpolation
-    :return: a dolfin vector representing the material dofs
+    :param periodic: whether to return a piecewise constant microstructure
+    :param degree: the degree of microstructure interpolation
+    :return: a dolfin vector representing the microstructure dofs
     """
     is_sorted = lambda a: np.all(a[:-1] <= a[1:])
     if not is_sorted(points):
@@ -314,10 +314,10 @@ def PC1DMaterial(Vh: dl.FunctionSpace, points: np.ndarray, values: np.ndarray, p
     # assert all(values > 0.0)
     assert all(points > 0.0)
     assert all(points < 1.0)
-    material_init = PC1D(points, values, periodic=periodic, degree=degree)
-    material = dl.Function(Vh)
-    material.interpolate(material_init)
-    return material.vector()
+    microstructure_init = PC1D(points, values, periodic=periodic, degree=degree)
+    microstructure = dl.Function(Vh)
+    microstructure.interpolate(microstructure_init)
+    return microstructure.vector()
 
 
 class Voronoi(dl.UserExpression):
@@ -344,23 +344,23 @@ class Voronoi(dl.UserExpression):
         return ()
 
 
-def VoronoiMaterial(Vh: dl.FunctionSpace, points: np.ndarray, values: np.ndarray,
+def VoronoiMicrostructure(Vh: dl.FunctionSpace, points: np.ndarray, values: np.ndarray,
                     degree: int = 5, periodic=True) -> dl.cpp.la.PETScVector:
     """
-    A function for generating Voronoi material in general dimensions of 1, 2, and 3
+    A function for generating Voronoi microstructure in general dimensions of 1, 2, and 3
     :param Vh: the function space intended for interpolation. Must be a scalar function space
     :param points: the points that generates the Voronoi. Must have shape (n_point, n_dim).
     :param values: the values of Voronoi pieces. Must have shape (n_point,)
-    :param degree: the degree of material interpolation
+    :param degree: the degree of microstructure interpolation
     :param periodic: whether to generate periodic Voronoi. Default is True
-    :return: a dolfin vector representing the material dofs
+    :return: a dolfin vector representing the microstructure dofs
     """
     assert values.size == points.shape[0]
     assert points.shape[1] == Vh.mesh().geometric_dimension()
-    material_init = Voronoi(points, values, degree=degree, periodic=periodic)
-    material = dl.Function(Vh)
-    material.interpolate(material_init)
-    return material.vector()
+    microstructure_init = Voronoi(points, values, degree=degree, periodic=periodic)
+    microstructure = dl.Function(Vh)
+    microstructure.interpolate(microstructure_init)
+    return microstructure.vector()
 
 
 def AssembleSPDTensor(angle: Any, d1: Any, d2: Any, Vh: dl.FunctionSpace = None) -> ufl.tensoralgebra.Dot:
@@ -396,8 +396,8 @@ def AssembleSPDTensor(angle: Any, d1: Any, d2: Any, Vh: dl.FunctionSpace = None)
 def AssembleIsotropicTensor(Vh: dl.FunctionSpace, modulus: Any, ratio: Any,
                             type: str = "plane_strain") -> ufl.algebra.Sum:
     """
-    :param modulus: the Young's modulus of the material
-    :param ratio: the poisson ratio
+    :param modulus: the Young's modulus of the microstructure property tensor
+    :param ratio: the poisson ratio of the microstructure property tensor
     :param Vh: the function space
     :param type: the type of Isotropic tensor. Plane stress and plane strain conditions are available
     :return: the ufl forms for the 4th order isotropic tensor.

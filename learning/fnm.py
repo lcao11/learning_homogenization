@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from .utils import *
+from .utils import _get_act
 
 class FNM2D(torch.nn.Module):
     """
