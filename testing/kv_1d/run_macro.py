@@ -113,7 +113,7 @@ if __name__=="__main__":
         m.eval()
 
     forcing_expr = dl.Expression("100*sin(8*pi*(x[0] + t))", t=0, degree=5)
-    rno_solver = RNOViscoelasticSolver1D(n_cells=250, device=device)
+    rno_solver = RNOViscoelasticSolver1D(n_cells=125, device=device)
     rno_solver.set_rno(models[0], models[1], n_internal=n_internal)
     kernel_solver = HomogenizedViscoelasticSolver1D(n_cells=40000)
 

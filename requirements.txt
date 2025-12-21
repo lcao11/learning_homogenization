@@ -1,0 +1,8 @@
+# Minimal Python dependencies for training-only workflows
+# (e.g., testing/kv_1d/run_training.py and testing/evp_1d/run_training.py)
+#
+# Note: Data generation and macro solvers additionally require external FEniCS/hippylib.
+
+numpy
+matplotlib
+torch
