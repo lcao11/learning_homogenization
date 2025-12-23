@@ -1,21 +1,21 @@
 # learning_homogenization
 
-Learn memory- and microstructure-dependnet constitutive models from cell-problem simulations (FEniCS/hIPPYlib), then use neural constitutive surrogates (PyTorch) for fast evaluation and (for KV) macro-scale comparisons.
+Learn memory- and microstructure-dependnet constitutive models from cell-problem simulations (FEniCS/hIPPYlib) using Markovian recurrent and Fourier neural operators.
 
 See the arXiv preprint: [arXiv:2502.05463](https://arxiv.org/abs/2502.05463) (DOI: 10.48550/arXiv.2502.05463)
 
 This repo currently contains two main 1D problem families:
 
-- KV 1D (Kelvin–Voigt viscoelasticity): generates strain/strain-rate/stress trajectories and (optionally) a memory-kernel representation; trains a recurrent neural operator-style surrogate; includes a macroscale benchmark comparing homogenized-memory vs multiscale vs neural surrogate.
-- EVP 1D (elasto-viscoplasticity): generates strain/stress trajectories for random microstructures; trains a surrogate.
+- KV 1D (Kelvin–Voigt viscoelasticity): generates strain/strain-rate/stress trajectories for a microstructure and (optionally) a memory-kernel representation. This repo also includes a macroscale benchmark comparing homogenized-memory vs multiscale vs learned in `testing/kv_1d/macro.py`.
+- EVP 1D (elasto-viscoplasticity): generates strain/stress trajectories for a microstructure
 
-The repo additionally contain KV 2D and 3D solver, which is thoroughly tested but the tutorial is not included yet.
+The repo contains KV solver for general dimensions (1, 2, and 3 dimensions), which is thoroughly tested but the tutorial beyond 1D is not yet included.
 
 ## Quickstart
 
 ### 1) Environment
 
-You’ll typically need two stacks:
+You’ll typically need two largely seperated stacks:
 
 - Simulation/data generation: FEniCS (`dolfin`/`ufl`) + `hippylib` + MPI
 - Learning/training: PyTorch + NumPy/SciPy + Matplotlib
@@ -50,7 +50,7 @@ A conda installation of FEniCS 2019.1.0 is recommended.
 conda create -n fenics-2019.1 -c conda-forge fenics==2019.1.0 matplotlib scipy jupyter
 ```
 
-See the `hippylib` project: [hippylib/hippylib](https://github.com/hippylib/hippylib)
+See the `hippylib` project to clone the latest version: [hippylib/hippylib](https://github.com/hippylib/hippylib)
 
 ### 2) Generate datasets
 
@@ -92,7 +92,7 @@ mpirun -n 1 python3 data/evp_1d/generate_pc.py \
 	--file_name data.pkl
 ```
 
-### 3) Train a surrogate constitutive model
+### 3) Train a constitutive model
 
 The training entry points live in `testing/`:
 
@@ -155,8 +155,8 @@ Notes:
 KV includes a macro-scale benchmark comparing:
 
 - homogenized viscoelastic solver using an explicit memory kernel,
-- periodic macro solver (many periods),
-- neural surrogate (RNO-style solver wrapping `F`/`G`).
+- multiscale solver (many microstructrues connected),
+- solver by the learned model.
 
 Entry points:
 
