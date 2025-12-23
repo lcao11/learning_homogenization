@@ -127,7 +127,7 @@ class HomogenizedViscoelasticSolver1D():
             for jj in range(ii):
                 rhs.axpy(self._memory_kernel[jj]*dt**2, self._A_h1semi*u_list[ii-jj].vector())
             rhs.axpy(-0.5*self._memory_kernel[0]*dt**2, self._A_h1semi*u_list[ii].vector())
-            rhs.axpy(-0.5*self._memory_kernel[ii]*dt**2, self._A_h1semi*u_list[0].vector())
+            rhs.axpy(0.5*self._memory_kernel[ii]*dt**2, self._A_h1semi*u_list[0].vector())
             self._bc0.apply(rhs)
             self._solver.solve(u_list[ii+1].vector(), rhs)
         return u_list

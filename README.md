@@ -50,6 +50,8 @@ A conda installation of FEniCS 2019.1.0 is recommended.
 conda create -n fenics-2019.1 -c conda-forge fenics==2019.1.0 matplotlib scipy jupyter
 ```
 
+See the `hippylib` project: [hippylib/hippylib](https://github.com/hippylib/hippylib)
+
 ### 2) Generate datasets
 
 Datasets are written as pickles with a filename pattern:
