@@ -150,50 +150,16 @@ class RNOViscoelasticSolver1D():
         s_trial, s_test = dl.TrialFunction(self._Gh), dl.TestFunction(self._Gh)
         A_sigma, _ = dl.assemble_system(dl.dot(s_trial, dl.grad(u_test))*dl.dx, u_test*dl.dx, self._bc0)
         self._A_f, _ = dl.assemble_system(dl.inner(u_trial, u_test)*dl.dx, u_test*dl.dx, self._bc0)
+        A_lhs, A_rhs = dl.assemble(dl.dot(s_trial, s_test)*dl.dx), dl.assemble(dl.dot(dl.grad(u_trial), s_test)*dl.dx)
         A_norm, _ = dl.assemble_system(dl.inner(u_trial, u_test)*dl.dx + dl.inner(dl.grad(u_trial), dl.grad(u_test))*dl.dx, u_test*dl.dx, self._bc0)
         self._A_sigma = PETScMatrix_to_torch(A_sigma, device=device, dtype=torch.float32)
-        self._device = device
-
-        # Torch sparse version of the L2 mass matrix (used to build RHS on GPU).
-        self._A_f_torch = PETScMatrix_to_torch(self._A_f, device=self._device, dtype=torch.float32).coalesce()
-
-        # Analytic CG1 -> DG0 gradient operator for a uniform 1D UnitIntervalMesh.
-        # Maps nodal values u (n_nodes = n_cells+1) to cellwise gradients du (n_cells).
-        n_cells = self._n_cells
-        n_nodes = self._Vh.dim()
-        n_cells_dg = self._Gh.dim()
-        if n_nodes != n_cells + 1 or n_cells_dg != n_cells:
-            raise ValueError(
-                f"Unexpected 1D dimensions: Vh.dim={n_nodes}, Gh.dim={n_cells_dg}, n_cells={n_cells}"
-            )
-        h = 1.0 / float(n_cells)
-        rows = torch.arange(n_cells, device=self._device, dtype=torch.long)
-        cols_left = rows
-        cols_right = rows + 1
-        grad_indices = torch.stack(
-            [torch.cat([rows, rows]), torch.cat([cols_left, cols_right])], dim=0
-        )
-        grad_values = torch.cat(
-            [
-                torch.full((n_cells,), -1.0 / h, device=self._device, dtype=torch.float32),
-                torch.full((n_cells,), 1.0 / h, device=self._device, dtype=torch.float32),
-            ]
-        )
-        self._grad_tensor = torch.sparse_coo_tensor(
-            grad_indices, grad_values, (n_cells, n_nodes)
-        ).coalesce()
-
-        # Residual weighting: avoid forming inv(A_norm). Use Cholesky factor for fast solves.
-        A_norm_t = PETScMatrix_to_torch(A_norm, device=self._device, dtype=torch.float32)
+        A_lhs = PETScMatrix_to_torch(A_lhs, device=device, dtype=torch.float32)
+        A_rhs = PETScMatrix_to_torch(A_rhs, device=device, dtype=torch.float32)
+        A_norm = PETScMatrix_to_torch(A_norm, device=device, dtype=torch.float32)
         with torch.no_grad():
-            self._A_norm_chol = torch.linalg.cholesky(A_norm_t.to_dense())
-
-        # Cache constant tensors used each timestep.
-        self._zero_pad = torch.zeros(1, 1, device=self._device, dtype=torch.float32)
-        mask = torch.ones(n_nodes, 1, device=self._device, dtype=torch.float32)
-        mask[0, 0] = 0.0
-        mask[-1, 0] = 0.0
-        self._mask = mask
+            self._grad_tensor = torch.linalg.solve(A_lhs.to_dense(), A_rhs.to_dense()).to_sparse()
+            self._res_weight = torch.linalg.inv(A_norm.to_dense())
+        self._device = device
     
     def set_microstructure(self, E, nu):
         # Shape convention matches learning.response: batch dimension = self._Gh.dim().
@@ -211,7 +177,7 @@ class RNOViscoelasticSolver1D():
         self._G = G.to(device=self._device)
         self._n_internal = n_internal
     
-    def solve(self, forcing_expr, return_internal=False, precompute_rhs: bool = True):
+    def solve(self, forcing_expr, return_internal=False):
         u_list = [dl.Function(self._Vh) for _ in range(self.parameters["nt"] + 1)]
         dt = self.parameters["T"] / self.parameters["nt"]
         times = np.linspace(0, self.parameters["T"], self.parameters["nt"] + 1)
@@ -219,69 +185,47 @@ class RNOViscoelasticSolver1D():
             xi_list = np.zeros((self.parameters["nt"] + 1, self._Gh.dim(), self._n_internal))
         xi = torch.zeros(self._Gh.dim(), self._n_internal).to(dtype=torch.float32, device=self._device)
         du_0 = torch.zeros(self._Gh.dim(), 1).to(dtype=torch.float32, device=self._device)
-        zero_pad = self._zero_pad
-        mask = self._mask
-        forcing_function = dl.Function(self._Vh)
+        zero_pad = torch.zeros(1, 1).to(dtype=torch.float32, device=self._device)
+        mask = torch.ones(self._Vh.dim(), 1).to(dtype=torch.float32, device=self._device)
+        mask[0, 0] = 0.0
+        mask[-1, 0] = 0.0
+        forcing_vector = dl.Function(self._Vh).vector()
 
-        rhs_all = None
-        if precompute_rhs:
-            # Precompute nodal RHS vectors for all timesteps on CPU, then transfer once to device.
-            # This avoids per-step CPU->GPU transfers of rhs.
-            rhs_np = np.zeros((self.parameters["nt"], self._Vh.dim()), dtype=np.float32)
-            rhs_vec = dl.Function(self._Vh).vector()
-            for ii in range(self.parameters["nt"]):
-                forcing_expr.t = times[ii + 1]
-                forcing_function.assign(dl.interpolate(forcing_expr, self._Vh))
-                rhs_vec.zero()
-                rhs_vec.axpy(1.0, self._A_f * forcing_function.vector())
-                rhs_np[ii, :] = rhs_vec.get_local().astype(np.float32, copy=False)
-            rhs_all = torch.from_numpy(rhs_np).to(device=self._device).unsqueeze(-1)
-
-        # Keep interior DOFs as a persistent torch tensor across all timesteps.
-        # This avoids FEniCS->NumPy->Torch copies for the initial guess each step.
-        u_var = torch.zeros(self._Vh.dim() - 2, 1, device=self._device, dtype=torch.float32, requires_grad=True)
-        optimizer = torch.optim.LBFGS([u_var], line_search_fn="strong_wolfe", max_iter=1000)
-
-        def force(u_var_local, xi_local, du0_local):
+        def force(u_var_local):
             u = torch.cat([zero_pad, u_var_local, zero_pad], dim=0)
             du = torch.sparse.mm(self._grad_tensor, u)
-            sigma = self._F(self._microstructure, du, (du - du0_local) / dt, xi_local)
+            sigma = self._F(self._microstructure, du, (du - du_0) / dt, xi)
             return torch.sparse.mm(self._A_sigma, sigma), du
 
         t0 = time.time()
         for ii in range(self.parameters["nt"]):
-            if rhs_all is not None:
-                rhs = rhs_all[ii]
-            else:
-                forcing_expr.t = times[ii + 1]
-                forcing_function.assign(dl.interpolate(forcing_expr, self._Vh))
-                f_vec = torch.as_tensor(
-                    forcing_function.vector().get_local(), device=self._device, dtype=torch.float32
-                ).unsqueeze(1)
-                rhs = torch.sparse.mm(self._A_f_torch, f_vec)
-
+            forcing_expr.t = times[ii + 1]
+            forcing_vector.zero()
+            forcing_vector.axpy(1.0, self._A_f*(dl.interpolate(forcing_expr, self._Vh).vector()))
+            rhs = torch.from_numpy(forcing_vector.get_local()).unsqueeze(1).to(dtype=torch.float32, device=self._device)
+            u_var = torch.from_numpy(u_list[ii].vector().get_local()[1:-1]).unsqueeze(1).to(dtype=torch.float32, device=self._device)
             with torch.no_grad():
                 xi = self._G(self._microstructure, du_0, xi)*dt + xi
+            u_var.requires_grad = True
             if return_internal:
                 xi_list[ii+1] = xi.detach().cpu().numpy()
+            optimizer = torch.optim.LBFGS([u_var], line_search_fn="strong_wolfe", max_iter=1000)
 
             def residual_norm(force_vec, rhs_vec):
-                r = force_vec - rhs_vec
-                # y = A_norm^{-1} r via Cholesky solve
-                y = torch.cholesky_solve(r, self._A_norm_chol)
-                return torch.einsum("ij, ij", r * mask, y)
+                res = torch.einsum("ij, jk -> ik", self._res_weight, force_vec - rhs_vec)
+                return torch.einsum("ij, ij", res*mask, force_vec - rhs_vec)
 
             def closure():
                 optimizer.zero_grad()
-                out, _ = force(u_var, xi, du_0)
+                out, _ = force(u_var)
                 objective = residual_norm(out, rhs)
                 objective.backward()
                 return objective
             
             optimizer.step(closure)
             with torch.no_grad():
-                _, du_0 = force(u_var, xi, du_0)
                 u = torch.cat([zero_pad, u_var, zero_pad], dim=0)
+                du_0 = torch.sparse.mm(self._grad_tensor, u)
             u_list[ii+1].vector().set_local(u.detach().cpu().numpy())
             progress_every = max(1, self.parameters["nt"] // 10)
             if (ii + 1) % progress_every == 0:
