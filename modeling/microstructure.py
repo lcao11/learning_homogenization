@@ -20,6 +20,11 @@ def MatrixInterpolation(matrix: np.ndarray, Vh: dl.FunctionSpace) -> dl.cpp.la.P
         :param Vh: the dolfin function space for the interpolation
         :return: a dolfin vector for dof values
     """
+    if Vh.mesh().mpi_comm().size > 1:
+        raise RuntimeError(
+            "MatrixInterpolation is not MPI-safe: it assumes a serial vertex ordering. "
+            "Use a dolfin Expression/UserExpression, or pass a distributed PETScVector/Function instead."
+        )
     if not Vh.dim() == matrix.size:
         raise Exception(
             "The function space has dimension of %d and the matrix has %d elements" % (Vh.dim(), matrix.size))
@@ -41,6 +46,10 @@ def MatrixExtraction(x: dl.cpp.la.PETScVector, Vh: dl.FunctionSpace) -> np.ndarr
         :param Vh: the dolfin function space for the interpolation
         :return: a numpy array for matrix representation of the vertex values
     """
+    if Vh.mesh().mpi_comm().size > 1:
+        raise RuntimeError(
+            "MatrixExtraction is not MPI-safe: it assumes a serial vertex ordering and a fully local vector."
+        )
     if not Vh.dim() == x.size():
         raise Exception(
             "The function space has dimension of %d and the vector has %d" % (Vh.dim(), x.size))

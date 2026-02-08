@@ -43,7 +43,7 @@ if __name__ == '__main__':
                         help="The number of samples")
 
     parser.add_argument('--n_pieces_max',
-                        default=10,
+                        default=20,
                         type=int,
                         help="The maximum number of pieces")
 
@@ -73,12 +73,12 @@ if __name__ == '__main__':
                         help="The minimum rate constant value")
     
     parser.add_argument('--rate_exponent_min',
-                        default=1,
+                        default=2,
                         type=float,
                         help="The minimum rate exponent value")
     
     parser.add_argument('--rate_exponent_max',
-                        default=10,
+                        default=5,
                         type=float,
                         help="The minimum rate exponent value")
 
@@ -93,7 +93,7 @@ if __name__ == '__main__':
                         help="The minimum yield stress value")
 
     parser.add_argument('--trajectory_interval',
-                        default=10,
+                        default=20,
                         type=int,
                         help="The number of interval for trajectory generation")
 
@@ -103,7 +103,7 @@ if __name__ == '__main__':
                         help="The upper and lower bound of the trajectory value")
 
     parser.add_argument('--output_path',
-                        default="./data/",
+                        default="./dataset/",
                         type=str,
                         help="The output path for saving")
 
@@ -133,11 +133,17 @@ if __name__ == '__main__':
 
     padded_string = datetime.now().strftime("%Y-%m-%d") + "_ElastoViscoplastic_PC1D_process" + str(tracer["process_id"]) + "_"
 
-    cell_problem = ElastoViscoplasticity1DCellProblem(**settings)
+    # `ElastoViscoplasticity1DSettings()` includes runtime keys like `nt` and `T` that are
+    # not accepted by the cell-problem constructor.
+    cell_problem = ElastoViscoplasticity1DCellProblem(
+        n_cells=settings["n_cells"],
+        FE_order=settings["FE_order"],
+    )
     cell_problem.parameters["verbose"] = False
     cell_problem.parameters["nt"] = 5000
     cell_problem.parameters["T"] = 1.0
-    tracer = {**tracer, **cell_problem.parameters, **settings}
+    # Ensure runtime parameters override defaults from `settings`.
+    tracer = {**tracer, **settings, **cell_problem.parameters}
 
     Vh = cell_problem.FunctionSpace()
 

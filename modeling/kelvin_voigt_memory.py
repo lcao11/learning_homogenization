@@ -12,7 +12,7 @@ def _flip(angles, index):
     return angles
 
 
-class KelvinVoightHomogenizedModel:
+class KelvinVoigtHomogenizedModel:
     def __init__(self, viscous=None, elastic=None, kernel=None, T=1.0):
         self._nu_p = viscous
         self._E_p = elastic
@@ -21,7 +21,7 @@ class KelvinVoightHomogenizedModel:
         self._dt = np.mean(self._t[1:] - self._t[:-1])
 
     def predict(self, ebar, rate):
-        if isinstance(ebar, np.ndarray) and isinstance(ebar, np.ndarray):
+        if isinstance(ebar, np.ndarray) and isinstance(rate, np.ndarray):
             ebar_array = ebar
             rate_array = rate
         else:
@@ -47,8 +47,8 @@ class KelvinVoightHomogenizedModel:
             angles = np.arccos(np.diagonal(np.abs(basis)))
             return s, angles
         elif type == "kernel":
-            angles = np.zeros((self.nt+1, 3))
-            s = np.zeros((self.nt+1, 3))
+            angles = np.zeros((self.nt + 1, 3))
+            s = np.zeros((self.nt + 1, 3))
             for ii, time in enumerate(self._t):
                 s[ii], basis = eigh(self._kernel[ii])
                 angles[ii] = np.arccos(np.diagonal(np.abs(basis)))
@@ -93,7 +93,7 @@ class KelvinVoightHomogenizedModel:
 
     @property
     def nt(self):
-        return self._t.size-1
+        return self._t.size - 1
 
     @property
     def times(self):

@@ -175,7 +175,7 @@ if __name__ == '__main__':
     if not os.path.exists(tracer["output_path"]):
         os.makedirs(tracer["output_path"], exist_ok=True)
 
-    settings = KelvinVoightSettings()
+    settings = KelvinVoigtSettings()
     settings["n_cells"] = 500
     settings["FE_order"] = 1
     settings["dim"] = 1
@@ -186,7 +186,7 @@ if __name__ == '__main__':
 
     padded_string = datetime.now().strftime("%Y-%m-%d") + "_mixture_random_field_process" + str(tracer["process_id"]) + "_"
 
-    cell_problem = KelvinVoightCellProblem(**settings)
+    cell_problem = KelvinVoigtCellProblem(**settings)
     cell_problem.parameters["verbose"] = False
     cell_problem.parameters["nt"] = 5000
     cell_problem.parameters["T"] = 1.0
