@@ -1,16 +1,5 @@
 import numpy as np
 from scipy.integrate import simpson
-from scipy.linalg import eigh
-import math
-
-
-def _flip(angles, index):
-    for ii in range(index.shape[0]):
-        if ii % 2 == 0:
-            angles[index[ii, 0]:index[ii + 1, 0], index[ii, 1]] = math.pi - angles[index[ii, 0]:index[ii + 1, 0],
-                                                                            index[ii, 1]]
-    return angles
-
 
 class KelvinVoigtHomogenizedModel:
     def __init__(self, viscous=None, elastic=None, kernel=None, T=1.0):
@@ -21,55 +10,63 @@ class KelvinVoigtHomogenizedModel:
         self._dt = np.mean(self._t[1:] - self._t[:-1])
 
     def predict(self, ebar, rate):
+        """Predict stress via the memory-form constitutive law.
+
+        Uses the convention
+
+            sigma(t) = E' e(t) + nu' e_dot(t) - \int_0^t K(t-s) e(s) ds,
+
+        where `e`, `e_dot`, and `sigma` are Kelvin--Mandel Voigt vectors of length `d_sym`.
+        """
+
         if isinstance(ebar, np.ndarray) and isinstance(rate, np.ndarray):
-            ebar_array = ebar
-            rate_array = rate
+            ebar_array = np.asarray(ebar)
+            rate_array = np.asarray(rate)
         else:
-            ebar_array = ebar(self._t)
-            rate_array = rate(self._t)
-        stress = np.zeros((self._t.size, self._nu_p.shape[0]))
-        stress[0] = self._nu_p @ rate_array[0]
-        for ii, time in enumerate(self._t[1:]):
+            ebar_array = np.asarray(ebar(self._t))
+            rate_array = np.asarray(rate(self._t))
+
+        # Coerce 1D trajectories to (nt+1, 1)
+        if ebar_array.ndim == 1:
+            ebar_array = ebar_array[:, None]
+        if rate_array.ndim == 1:
+            rate_array = rate_array[:, None]
+
+        # Accept either (nt+1, d) or (d, nt+1)
+        if ebar_array.shape[0] != self._t.size and ebar_array.shape[-1] == self._t.size:
+            ebar_array = ebar_array.T
+        if rate_array.shape[0] != self._t.size and rate_array.shape[-1] == self._t.size:
+            rate_array = rate_array.T
+
+        if ebar_array.shape[0] != self._t.size or rate_array.shape[0] != self._t.size:
+            raise ValueError(
+                "Trajectory length mismatch: expected first dimension to be nt+1=%d (times), got ebar %s and rate %s"
+                % (self._t.size, ebar_array.shape, rate_array.shape)
+            )
+
+        d = int(self._nu_p.shape[0])
+        if ebar_array.shape[1] != d or rate_array.shape[1] != d:
+            raise ValueError(
+                "Trajectory component mismatch: expected d_sym=%d, got ebar %s and rate %s"
+                % (d, ebar_array.shape, rate_array.shape)
+            )
+
+        stress = np.zeros((self._t.size, d))
+
+        # t = 0: integral term is zero.
+        stress[0] = self._nu_p @ rate_array[0] + self._E_p @ ebar_array[0]
+
+        for ii, _time in enumerate(self._t[1:]):
             step = ii + 1
             stress[step] = self._nu_p @ rate_array[step] + self._E_p @ ebar_array[step]
-            kernel_flip = np.flip(-self._kernel[:step + 1], 0)
-            integrand = np.einsum("ijk, ik -> ij", kernel_flip, ebar_array[:step + 1])
-            stress[step] += simpson(integrand, dx=self._dt, axis=0)
+
+            # Discrete approximation of \int_0^{t_step} K(t_step - s) e(s) ds.
+            # With uniform time grid, this is a convolution with the kernel sampled at t_k.
+            kernel_flip = np.flip(self._kernel[: step + 1], 0)
+            integrand = np.einsum("ijk,ik->ij", kernel_flip, ebar_array[: step + 1])
+            stress[step] -= simpson(integrand, dx=self._dt, axis=0)
+
         return self._t, stress
-
-    def eigen(self, type=None):
-        if type == "viscous":
-            s, basis = eigh(self._nu_p)
-            angles = np.arccos(np.diagonal(np.abs(basis)))
-            return s, angles
-        elif type == "elastic":
-            s, basis = eigh(self._E_p)
-            angles = np.arccos(np.diagonal(np.abs(basis)))
-            return s, angles
-        elif type == "kernel":
-            angles = np.zeros((self.nt + 1, 3))
-            s = np.zeros((self.nt + 1, 3))
-            for ii, time in enumerate(self._t):
-                s[ii], basis = eigh(self._kernel[ii])
-                angles[ii] = np.arccos(np.diagonal(np.abs(basis)))
-            index = self._check_for_reflection(angles)
-            angles = _flip(angles, index)
-            return s, angles
-        else:
-            raise Exception("Wrong type. Must be viscous, elastic or kernel.")
-
-    def _check_for_reflection(self, angles):
-        angels_1st_rate = np.gradient(angles, self.dt, axis=0, edge_order=2)
-        angels_2nd_rate = np.gradient(angels_1st_rate, self.dt, axis=0, edge_order=2)
-        index = np.vstack(
-            np.where(np.abs(angels_2nd_rate - np.mean(angels_2nd_rate, axis=0)) > 5 * np.std(angels_2nd_rate))).T[1::3]
-        unique, count = np.unique(index[:, 1], return_counts=True)
-        for ii, id in enumerate(unique):
-            if count[ii] % 2 != 0:
-                index = np.vstack((index, np.array([0, id])))
-        for ii in range(2):
-            index = index[index[:, ii].argsort()]
-        return index
 
     @property
     def viscous(self):

@@ -117,7 +117,7 @@ class ODETrajectory:
     This class creates a function as a time integration of another function.
     """
 
-    def __init__(self, fun: Any, initial_value: list[float, ...] = None, T: float = 1.0) -> None:
+    def __init__(self, fun: Any, initial_value: Any = None, T: float = 1.0) -> None:
         """
         :param fun: the function used for integration, must return time derivative values when input times and values
         :param initial_value: the list of initial values, also accept numpy arrays

@@ -31,9 +31,26 @@ def KelvinVoigtSettings():
 
 
 def _tensor2array_index(d: int) -> np.ndarray:
-    """
-    :param d: the dimension of the cell problem
-    :return: the 2d matrix containing the array index of a symmetric 2nd order tensor
+    """Return the index map for flattening a symmetric tensor.
+
+    This defines the ordering used throughout this module for the symmetric components.
+    The ordering is the upper-triangular traversal
+
+    - 2D: (11, 12, 22)
+    - 3D: (11, 12, 13, 22, 23, 33)
+
+    i.e. indices are assigned by increasing row `i` and then increasing column `j>=i`.
+
+    Parameters
+    ----------
+    d:
+        Spatial dimension.
+
+    Returns
+    -------
+    np.ndarray
+        Integer array `idx` of shape `(d, d)` such that `idx[i,j]` gives the position in a length-`d_sym`
+        vector corresponding to the symmetric component `(min(i,j), max(i,j))`.
     """
 
     out = np.zeros((d, d)).astype(int)
@@ -48,7 +65,7 @@ def _tensor2array_index(d: int) -> np.ndarray:
 
 
 def array2tensor_mapping(d: int) -> np.ndarray:
-    """
+    r"""
         Kelvin--Mandel mapping from a symmetric-tensor vector representation to a symmetric tensor.
 
         Convention: the input array is in Kelvin--Mandel form, i.e. diagonal components are
@@ -73,7 +90,7 @@ def array2tensor_mapping(d: int) -> np.ndarray:
 
 
 def tensor2array_mapping(d: int) -> np.ndarray:
-    """
+    r"""
     Kelvin--Mandel mapping from a symmetric tensor to its Kelvin--Mandel vector representation.
 
     This is the inverse mapping of `array2tensor_mapping` (for symmetric tensors):
@@ -96,11 +113,22 @@ def tensor2array_mapping(d: int) -> np.ndarray:
 
 
 def array2tensor(array: np.ndarray, map: np.ndarray, d: int) -> np.ndarray:
-    """
-    :param array: the input array
-    :param map: the map from array to tensor
-    :param d: the dimension of the problem
-    :return: the symmetric tensor corresponding to the array
+    """Map a Kelvin--Mandel (KM) vector to a symmetric tensor.
+
+    Parameters
+    ----------
+    array:
+        1D array of length `d_sym` representing a symmetric tensor in **Kelvin--Mandel Voigt** form
+        (same ordering as `_tensor2array_index`, with shear scaled by $\sqrt{2}$).
+    map:
+        The transform returned by `array2tensor_mapping(d)`.
+    d:
+        Spatial dimension.
+
+    Returns
+    -------
+    np.ndarray
+        Symmetric tensor of shape `(d, d)` in physical tensor components.
     """
 
     out = np.einsum("ijk,k->ij", map, array) if d > 1 else np.expand_dims(array, axis=0)
@@ -131,12 +159,21 @@ def _variational_forms(
 
 
 class KelvinVoigtCellProblem:
-    """
+    r"""
     Solver for Kelvin Voigt viscoelasticity cell problem.
 
     Given elastic (E) and viscous (nu) microstructure properties and imposed averaged strain and strain-rate
     trajectories, solve the periodic cell problem and compute the averaged stress trajectory.
-    """
+
+        Notes
+        -----
+        - Strain/rate inputs and stress outputs are **Kelvin--Mandel Voigt** vectors of length `d_sym`.
+            Diagonal components are unchanged and off-diagonals are scaled by $\sqrt{2}$.
+        - All linear solves are posed on a mixed space `(u, lambda)` where `lambda` enforces a mean-zero
+            constraint (via a Lagrange multiplier). This constraint is present in every solve.
+        - This class does not support any legacy "solve viscous stress" mode; only the averaged stress
+            trajectory in KM coordinates is exposed.
+        """
 
     def __init__(self, n_cells=100, dim=2, FE_order=1, direct_solver=True) -> None:
         self._p, self._n_cells, self._dim, self._direct_solver = FE_order, n_cells, dim, direct_solver
@@ -145,6 +182,7 @@ class KelvinVoigtCellProblem:
         self._lift = LiftingFunction(self._Vh, self.dim)
         (
             self._A_E,
+            self._A_nu,
             self._E,
             self._nu,
             self._E_bar,
@@ -153,10 +191,9 @@ class KelvinVoigtCellProblem:
             self._f_nu,
             self._rhs_mean,
             self._solver,
-        ) = [None] * 9
+        ) = [None] * 10
         self._projector = Projector(self._Ph, self._Vh)
         self.parameters = {}
-        self.parameters["solve_for_viscous_stress"] = False
         self.parameters["verbose"] = False
         self.parameters["nt"] = 1000
         self.parameters["T"] = 1.0
@@ -164,6 +201,9 @@ class KelvinVoigtCellProblem:
         self.parameters["relative_tolerance"] = 1e-10
 
     def _create_spaces(self, pbc: object) -> None:
+        """
+        :param pbc: a periodic boundary with methods `inside()` and `map()`.
+        """
         VCGp = dl.VectorElement("Lagrange", self._mesh.ufl_cell(), self.FE_order)
         CGp = dl.FiniteElement("Lagrange", self._mesh.ufl_cell(), self.FE_order)
         R = dl.VectorElement("R", self._mesh.ufl_cell(), 0)
@@ -181,6 +221,10 @@ class KelvinVoigtCellProblem:
         self._help_free = self.generate_vector(type="free")
 
     def FunctionSpace(self, type: str = None) -> dl.FunctionSpace:
+        """
+        :param type: type of function space to return
+        :return: requested function space
+        """
         if type is None or type == "free":
             return self._Vh
         elif type == "scalar":
@@ -195,6 +239,10 @@ class KelvinVoigtCellProblem:
             raise Exception(type_error_message())
 
     def generate_vector(self, type: str = None) -> dl.Vector:
+        """
+        :param type: the type of dolfin vector to return
+        :return: requested dolfin vector
+        """
         if type is None or type == "free":
             return dl.Function(self._Vh).vector()
         elif type == "scalar":
@@ -210,10 +258,37 @@ class KelvinVoigtCellProblem:
 
     def _assemble_system(
         self, E: Any, nu: Any
-    ) -> tuple[dl.Matrix, dl.Matrix, list[dl.Vector], list[list[dl.Vector]], list[list[dl.Vector]]]:
+    ) -> tuple[
+        dl.Matrix,
+        dl.Matrix,
+        dl.Matrix,
+        list[dl.Vector],
+        list[list[dl.Vector]],
+        list[list[dl.Vector]],
+    ]:
+        r"""Assemble the matrices/vectors reused across solves.
+
+        Parameters
+        ----------
+        E, nu:
+            4th-order (UFL) elasticity/viscosity tensors for the microstructure.
+
+        Returns
+        -------
+        A_lhs:
+            Mixed-space constrained solve operator (viscous term + mean-zero constraint blocks).
+        A_E:
+            Mixed-space elastic operator used in the homogeneous evolution and RHS assembly.
+        A_nu:
+            Mixed-space viscous bilinear-form operator (displacement block only). Cached for evaluating
+            $(\cdot,\cdot)_\nu$ inner products in `extract_memory_form()`.
+        rhs_mean, f_E, f_nu:
+            Preassembled vectors used to build RHS terms.
+        """
         dx = dl.Measure("dx", self._mesh)
         A_lhs = dl.PETScMatrix(self._Mh.mesh().mpi_comm())
         A_E = dl.PETScMatrix(self._Mh.mesh().mpi_comm())
+        A_nu = dl.PETScMatrix(self._Mh.mesh().mpi_comm())
 
         (u_trial, lam_trial) = dl.split(dl.TrialFunction(self._Mh))
         (u_test, lam_test) = dl.split(dl.TestFunction(self._Mh))
@@ -228,6 +303,7 @@ class KelvinVoigtCellProblem:
 
         dl.assemble(varf_lhs, tensor=A_lhs)
         dl.assemble(varf_E, tensor=A_E)
+        dl.assemble(varf_nu, tensor=A_nu)
 
         rhs_mean = [None for _ in range(self.dim)]
         f_E = [[None for _ in range(self.dim)] for _ in range(self.dim)]
@@ -247,9 +323,14 @@ class KelvinVoigtCellProblem:
                 f_E[ii][jj] = dl.assemble(varf_E)
                 f_nu[ii][jj] = dl.assemble(varf_nu)
 
-        return A_lhs, A_E, rhs_mean, f_E, f_nu
+        return A_lhs, A_E, A_nu, rhs_mean, f_E, f_nu
 
     def _assemble_stress_map(self, E: ufl.tensors, nu: ufl.tensors) -> tuple[np.ndarray, np.ndarray]:
+        """
+        :param E: an ufl tensor
+        :param nu: an ufl tensor
+        :return: the spatial mean of E and nu components
+        """
         dx = dl.Measure("dx", self._mesh)
         E_bar = np.zeros((self.dim, self.dim, self.dim, self.dim))
         nu_bar = np.zeros((self.dim, self.dim, self.dim, self.dim))
@@ -264,6 +345,12 @@ class KelvinVoigtCellProblem:
         return E_bar, nu_bar
 
     def _assemble_rhs(self, z, strain, rate):
+        """
+        This function assemble the rhs matrix for RK4 scheme.
+        :param z: the current state vector
+        :param strain: the 3-point stencil values of strain tensor
+        :param rate: the 3-point stencil values of strain rate tensor
+        """
         self._help_rhs.zero()
         self._help_mixed[1].zero()
 
@@ -284,6 +371,12 @@ class KelvinVoigtCellProblem:
             self._help_mixed[1].axpy(1.0, self._help_mixed[0])
 
     def set_microstructure(self, E: Any, nu: Any) -> None:
+        """
+        :param E: the microstructure elastic property
+        :param nu: the microstructure viscous property
+        The microstructures must be given as one the following type:
+        (1) dolfin vectors; (2) matrices; (3) functions; (4) an ufl matrix
+        """
         microstructure = [None] * 2
         error_message = (
             "The size of the matrix does not match the scalar free function space nor the scalar periodic"
@@ -329,7 +422,7 @@ class KelvinVoigtCellProblem:
             print("Assemble required matrices and vectors....")
             time0 = time.time()
 
-        A_lhs, self._A_E, self._rhs_mean, self._f_E, self._f_nu = self._assemble_system(
+        A_lhs, self._A_E, self._A_nu, self._rhs_mean, self._f_E, self._f_nu = self._assemble_system(
             microstructure[0], microstructure[1]
         )
         self._E_bar, self._nu_bar = self._assemble_stress_map(microstructure[0], microstructure[1])
@@ -363,6 +456,14 @@ class KelvinVoigtCellProblem:
         strain: np.ndarray,
         rate: np.ndarray,
     ) -> None:
+        """
+        :param stress: a numpy array for stress history.
+        :param step_count: an integer for step count, with t=0 has count 0.
+        :param sigma_E: a numpy ndarray for elastic stress component for the periodic solution
+        :param sigma_nu: a numpy ndarray for viscous stress component for the periodic solution
+        :param strain: a numpy ndarray for the symmetric tensor form of strain history (up to 5 steps)
+        :param rate: a numpy ndarray for the symmetric tensor form of strain rate history (up to 5 steps)
+        """
         if 6 <= step_count <= 8:
             coeff = coeff_6th_side[::-1, np.newaxis, np.newaxis]
             offset, current = 6, -1
@@ -394,103 +495,211 @@ class KelvinVoigtCellProblem:
             )
 
     def _assign_displacement(self, displacement: dl.Vector, periodic: dl.Vector, strain: np.ndarray) -> None:
+        """
+        Build the full displacement by adding periodic deviation and affine lifting.
+
+        Parameters
+        ----------
+        displacement:
+            Output displacement vector in the free space.
+        periodic:
+            Periodic deviation vector (periodic space).
+        strain:
+            Symmetric strain tensor (shape `(dim, dim)`) used to generate the affine lifting.
+        """
         temp = self._projector.project(periodic)
         varepsilon = self._lift.generate(strain)
         displacement.zero()
         displacement.axpy(1.0, temp.vector())
         displacement.axpy(1.0, varepsilon)
 
-    def _solve_for_stress(self, z, strain, rate, compute_memory=False):
-        self._help_rhs.zero()
-        self._help_rhs.axpy(-1.0, self._A_E * z)
+    def extract_memory_form(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        r"""Extract the memory-form homogenized model in Kelvin--Mandel Voigt form.
 
-        for ii in range(self.dim):
-            for jj in range(self.dim):
-                self._help_rhs.axpy(rate[ii, jj], self._rhs_mean[ii])
+        The returned objects satisfy the convolution constitutive law
 
-        for ii in range(self.dim):
-            for jj in range(self.dim):
-                self._help_rhs.axpy(-strain[ii, jj], self._f_E[ii][jj])
-                self._help_rhs.axpy(-rate[ii, jj], self._f_nu[ii][jj])
+          sigma(t) = E' e(t) + nu' e_dot(t) - \int_0^t K(t-s) e(s)\,ds,
 
-        self._solver.solve(self._help_mixed[0], self._help_rhs)
+        where e, e_dot, sigma are Kelvin--Mandel vectors of length `d_sym`.
 
-        stress = np.einsum("ijkl,kl->ij", self._E_bar, strain) + np.einsum("ijkl,kl->ij", self._nu_bar, rate)
-        for ii in range(self.dim):
-            for jj in range(self.dim):
-                stress[ii, jj] += self._f_E[ii][jj].inner(z)
-                stress[ii, jj] += self._f_nu[ii][jj].inner(self._help_mixed[0])
+                KM vs tensor checklist
+                ---------------------
+                This method intentionally switches between two representations:
 
-        if not compute_memory:
-            return stress
+                - Kelvin--Mandel (KM) vectors: length `d_sym`, shear scaled by $\sqrt{2}$.
+                    This is the representation of the *returned* operators `nu_prime`, `E_prime`, and `kernel`.
+                - Physical symmetric tensors: shape `(dim, dim)`, with shear entries as true tensor components.
+                    This is the representation required by the PDE / variational forms.
 
-        self._help_rhs.zero()
-        self._help_rhs.axpy(-1.0, self._A_E * self._help_mixed[0])
-        for ii in range(self.dim):
-            for jj in range(self.dim):
-                self._help_rhs.axpy(-rate[ii, jj], self._f_E[ii][jj])
-        self._solver.solve(self._help_mixed[1], self._help_rhs)
+                Concretely in the implementation:
 
-        stress_rate_1 = np.einsum("ijkl,kl->ij", self._E_bar, rate)
-        for ii in range(self.dim):
-            for jj in range(self.dim):
-                stress_rate_1[ii, jj] += self._f_E[ii][jj].inner(self._help_mixed[0])
-                stress_rate_1[ii, jj] += self._f_nu[ii][jj].inner(self._help_mixed[1])
+                - `a2t_map = array2tensor_mapping(dim)` maps KM vectors -> tensor components.
+                - `t2a_map = tensor2array_mapping(dim)` maps tensor components -> KM vectors.
+                - `basis_tensors[m]` is the physical-tensor representative of the KM unit vector $e_m$.
+                    For shear modes this has off-diagonals equal to $1/\sqrt{2}$.
+                - The RHS assembly loops over `i,j` and uses `e_tensor[i,j]` in tensor form.
+                - `nu_prime[:, m]` and `E_prime[:, m]` are produced by mapping the computed *tensor* averages
+                    back into KM coordinates using `t2a_map`.
+                - `kernel[n, row, col]` is computed as a $\nu$-inner product on the mixed space and therefore
+                    corresponds to the KM-basis pairing $(e_{row}, e_{col})$.
 
-        self._help_rhs.zero()
-        self._help_rhs.axpy(-1.0, self._A_E * self._help_mixed[1])
-        self._solver.solve(self._help_mixed[0], self._help_rhs)
+        This implementation follows the two static unit-cell problems for q_e^(1), q_e^(2)
+        and the homogeneous evolution problem for phi_e(t) (see attached equations).
+        All linear solves reuse the factorization/preconditioner already set up in `set_microstructure`.
 
-        stress_rate_2 = np.zeros((self.dim, self.dim))
-        for ii in range(self.dim):
-            for jj in range(self.dim):
-                stress_rate_2[ii, jj] += self._f_E[ii][jj].inner(self._help_mixed[1])
-                stress_rate_2[ii, jj] += self._f_nu[ii][jj].inner(self._help_mixed[0])
+        :return: (nu_prime, E_prime, kernel) with shapes:
+                 nu_prime: (d_sym, d_sym)
+                 E_prime:  (d_sym, d_sym)
+                 kernel:   (nt+1, d_sym, d_sym) where kernel[n] corresponds to K(t_n).
+        """
 
-        return stress, stress_rate_1, stress_rate_2
+        if self._solver is None or self._E is None or self._nu is None:
+            raise RuntimeError("Call set_microstructure(E, nu) before extract_memory_form().")
 
-    def extract_memory_form(self):
-        time1, time2 = None, None
+        time1 = time.time() if self.parameters["verbose"] else None
         if self.parameters["verbose"]:
-            time1 = time.time()
-            print("Solving for stress and stress rate of changes for unit strain rate trajectories...")
+            print("Extracting (nu', E', K(t)) memory form...")
 
-        t2a_map = tensor2array_mapping(self.dim)
-        times = np.linspace(0, self.T, self.nt + 1)
-        stress = np.zeros((self.nt + 1, self.d_sym, self.dim, self.dim))
-        stress_rate_1 = np.zeros((self.nt + 1, self.d_sym, self.dim, self.dim))
-        stress_rate_2 = np.zeros((self.nt + 1, self.d_sym, self.dim, self.dim))
-        a2t_map = array2tensor_mapping(self.dim)
+        dim = self.dim
+        d_sym = self.d_sym
+        dt = self.dt
+        times = np.linspace(0.0, self.T, self.nt + 1)
 
+        a2t_map = array2tensor_mapping(dim)
+        t2a_map = tensor2array_mapping(dim)
+
+        nu_prime = np.zeros((d_sym, d_sym))
+        E_prime = np.zeros((d_sym, d_sym))
+        kernel = np.zeros((self.nt + 1, d_sym, d_sym))
+
+        # Precompute physical-tensor representatives of the Kelvin--Mandel basis vectors.
+        # Concretely, `basis_tensors[m]` is the symmetric tensor you get by mapping the KM unit vector e_m
+        # through `array2tensor_mapping(dim)`.
+        basis_tensors = [a2t_map[:, :, m].copy() for m in range(d_sym)]
+
+        # Solve the two static cell problems for each basis direction.
+        z2_list: list[dl.Vector] = []
+        rhs = self.generate_vector(type="mixed")
+        sol = self.generate_vector(type="mixed")
+
+        for m in range(d_sym):
+            e_tensor = basis_tensors[m]
+
+            # The static cell problem solution in the viscous limit
+            rhs.zero()
+            for i in range(dim):
+                for j in range(dim):
+                    rhs.axpy(float(e_tensor[i, j]), self._f_nu[i][j])
+            sol.zero()
+            self._solver.solve(sol, rhs)
+            z1 = self.generate_vector(type="mixed")
+            z1.zero()
+            z1.axpy(1.0, sol)
+
+            # The static cell problem solution with the elastic contribution
+            rhs.zero()
+            # + <E psi^(1), sym grad v>
+            rhs.axpy(1.0, self._A_E * z1)
+            # - <E e, sym grad v>
+            for i in range(dim):
+                for j in range(dim):
+                    rhs.axpy(-float(e_tensor[i, j]), self._f_E[i][j])
+            sol.zero()
+            self._solver.solve(sol, rhs)
+            z2 = self.generate_vector(type="mixed")
+            z2.zero()
+            z2.axpy(1.0, sol)
+            z2_list.append(z2)
+
+            # Compute nu' * e_m = \int nu:(e_m + eps(psi^(1)))
+            avg_nu_psi1 = np.zeros((dim, dim))
+            for i in range(dim):
+                for j in range(dim):
+                    avg_nu_psi1[i, j] = self._f_nu[i][j].inner(z1)
+            nu_stress = np.einsum("ijkl,kl->ij", self._nu_bar, e_tensor) - avg_nu_psi1
+            nu_prime[:, m] = np.einsum("ij,ijm->m", nu_stress, t2a_map)
+
+            # Compute E' * e_m = \int E:(e_m + eps(psi^(1))) + \int nu:eps(psi^(2))
+            avg_E_psi1 = np.zeros((dim, dim))
+            avg_nu_psi2 = np.zeros((dim, dim))
+            for i in range(dim):
+                for j in range(dim):
+                    avg_E_psi1[i, j] = self._f_E[i][j].inner(z1)
+                    avg_nu_psi2[i, j] = self._f_nu[i][j].inner(z2)
+            E_stress = np.einsum("ijkl,kl->ij", self._E_bar, e_tensor) - avg_E_psi1 + avg_nu_psi2
+            E_prime[:, m] = np.einsum("ij,ijm->m", E_stress, t2a_map)
+
+        # The viscous bilinear form matrix on the *mixed* space (displacement block only)
+        # is assembled once in set_microstructure() and stored as self._A_nu.
+        if self._A_nu is None:
+            raise RuntimeError("Internal error: viscous matrix was not assembled. Call set_microstructure() first.")
+
+        # Time evolution for phi_e(t): A_lhs z_dot + A_E z = 0, with z(0)=q^(2).
         z = self.generate_vector(type="mixed")
-        for ii in range(self.d_sym):
-            strain = np.zeros((3, self.dim, self.dim))
-            rate = np.repeat(np.expand_dims(a2t_map[:, :, ii], axis=0), 3, axis=0)
+        k1 = self.generate_vector(type="mixed")
+        k2 = self.generate_vector(type="mixed")
+        k3 = self.generate_vector(type="mixed")
+        k4 = self.generate_vector(type="mixed")
+        tmp = self.generate_vector(type="mixed")
+        rhs_h = self.generate_vector(type="mixed")
+
+        nu_prod = self.generate_vector(type="mixed")
+
+        for col in range(d_sym):
             z.zero()
-            for step_count, t in enumerate(times):
-                for jj in range(3):
-                    strain[jj] = (t + (1 - 0.5 * jj) * self.dt) * a2t_map[:, :, ii]
+            z.axpy(1.0, z2_list[col])
 
-                (
-                    stress[step_count, ii],
-                    stress_rate_1[step_count, ii],
-                    stress_rate_2[step_count, ii],
-                ) = self._solve_for_stress(z, strain[-1], rate[-1], compute_memory=True)
+            for n, _t in enumerate(times):
+                # Compute kernel[:, col] at t_n via the nu-inner product on the mixed space:
+                #   K_{row,col}(t_n) = ( q^(2)_row, phi_col(t_n) )_nu
+                # This avoids extracting periodic components and keeps mean-zero constraints in every solve.
+                self._A_nu.mult(z, nu_prod)
+                for row in range(d_sym):
+                    kernel[n, row, col] = z2_list[row].inner(nu_prod)
 
-                if step_count < self.nt:
-                    self._assemble_rhs(z, strain, rate)
-                    self._solver.solve(self._help_mixed[0], self._help_rhs)
-                    z.axpy(1.0, self._help_mixed[0])
+                if n == self.nt:
+                    break
+
+                # RK4 step for z_dot = -A_lhs^{-1} (A_E z)
+                rhs_h.zero()
+                rhs_h.axpy(-1.0, self._A_E * z)
+                k1.zero()
+                self._solver.solve(k1, rhs_h)
+
+                tmp.zero()
+                tmp.axpy(1.0, z)
+                tmp.axpy(0.5 * dt, k1)
+                rhs_h.zero()
+                rhs_h.axpy(-1.0, self._A_E * tmp)
+                k2.zero()
+                self._solver.solve(k2, rhs_h)
+
+                tmp.zero()
+                tmp.axpy(1.0, z)
+                tmp.axpy(0.5 * dt, k2)
+                rhs_h.zero()
+                rhs_h.axpy(-1.0, self._A_E * tmp)
+                k3.zero()
+                self._solver.solve(k3, rhs_h)
+
+                tmp.zero()
+                tmp.axpy(1.0, z)
+                tmp.axpy(dt, k3)
+                rhs_h.zero()
+                rhs_h.axpy(-1.0, self._A_E * tmp)
+                k4.zero()
+                self._solver.solve(k4, rhs_h)
+
+                z.axpy(dt / 6.0, k1)
+                z.axpy(dt / 3.0, k2)
+                z.axpy(dt / 3.0, k3)
+                z.axpy(dt / 6.0, k4)
 
         if self.parameters["verbose"]:
             time2 = time.time()
-            print("Total time: %1.2fs" % (time2 - time1))
+            print("Finished memory form extraction. Took %1.2fs" % (time2 - time1))
 
-        return (
-            np.einsum("ijkl, klm -> ijm", stress, t2a_map),
-            np.einsum("ijkl, klm -> ijm", stress_rate_1, t2a_map),
-            np.einsum("ijkl, klm -> ijm", stress_rate_2, t2a_map),
-        )
+        return nu_prime, E_prime, kernel
 
     def solve(
         self,
@@ -501,6 +710,38 @@ class KelvinVoigtCellProblem:
         file: dl.File = None,
         snapshots: list[int] | None = None,
     ):
+        """Solve the time-dependent constrained cell problem.
+
+        The inputs/outputs are Kelvin--Mandel Voigt vectors of length `d_sym`.
+
+                KM vs tensor checklist
+                ---------------------
+                - `strain_func(t)` and `rate_func(t)` return KM vectors (length `d_sym`).
+                - Internally these are mapped to physical symmetric tensors via `array2tensor(...)` before
+                    assembling right-hand sides for the PDE.
+                - Internal stress accumulation (`stress` array) is stored in tensor form with shape `(dim, dim)`.
+                - The returned `stress_km` is obtained by mapping the tensor stresses back to KM vectors via
+                    `tensor2array_mapping(dim)`.
+
+        :param strain_func: callable returning a 1D numpy array of length `d_sym` for t in [0, T]
+        :param rate_func: callable returning a 1D numpy array of length `d_sym` for t in [0, T]
+        :param return_displacement: A flag for returning displacement as a list of dolfin vectors. Default to `False`
+        :param return_periodic: A flag for returning periodic part of the displacement as a list of dolfin vectors. Default to `False`.
+        :param file: the pvd file for saving the solution state
+        :param snapshots: the numpy array for the time slices requested for return or saving the state evolution.
+        Returns
+        -------
+        Depending on flags, this returns:
+
+        - `(times, stress_km)`
+        - `(times, stress_km, displacement_list)`
+        - `(times, stress_km, periodic_list)`
+        - `(times, stress_km, displacement_list, periodic_list)`
+
+        where:
+        - `times` has shape `(nt+1,)`.
+        - `stress_km` has shape `(nt+1, d_sym)` and is in Kelvin--Mandel Voigt form.
+        """
         clock_ebar, clock_solve, clock_stress = None, None, None
         if return_displacement and self.parameters["verbose"]:
             print("Computing displacement is done via L2 project and it can be slow.")
@@ -533,9 +774,6 @@ class KelvinVoigtCellProblem:
         rate = rate_func(0.0)
         assert rate.size == self.d_sym
         rate_hist[1] = array2tensor(rate, a2t_map, self.dim)
-
-        if self.parameters["solve_for_viscous_stress"]:
-            stress[0] = self._solve_for_stress(z, strain_hist[1], rate_hist[1], compute_memory=False)
 
         u_list, u_p_list = [], []
 
@@ -576,14 +814,11 @@ class KelvinVoigtCellProblem:
                 clock_solve = time.time()
                 solve_time += clock_solve - clock_ebar
 
-            if not self.parameters["solve_for_viscous_stress"]:
-                for ii in range(self.dim):
-                    for jj in range(self.dim):
-                        sigma_E_hist[0, ii, jj] = self._f_E[ii][jj].inner(z)
-                        sigma_nu_hist[0, ii, jj] = self._f_nu[ii][jj].inner(z)
-                self._update_stress(stress, step_count + 1, sigma_E_hist, sigma_nu_hist, strain_hist, rate_hist)
-            else:
-                stress[step_count + 1] = self._solve_for_stress(z, strain_hist[0], rate_hist[0], compute_memory=False)
+            for ii in range(self.dim):
+                for jj in range(self.dim):
+                    sigma_E_hist[0, ii, jj] = self._f_E[ii][jj].inner(z)
+                    sigma_nu_hist[0, ii, jj] = self._f_nu[ii][jj].inner(z)
+            self._update_stress(stress, step_count + 1, sigma_E_hist, sigma_nu_hist, strain_hist, rate_hist)
 
             if self.parameters["verbose"]:
                 clock_stress = time.time()

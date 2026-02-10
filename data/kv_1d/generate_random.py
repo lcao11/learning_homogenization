@@ -249,13 +249,13 @@ if __name__ == '__main__':
 
         # solve the cell problem
         t, stress = cell_problem.solve(strain, strain_rate)
-        stress_unit, stress_rate_1_unit, stress_rate_2_unit = cell_problem.extract_memory_form()
+            nu_p, E_p, K = cell_problem.extract_memory_form()
 
         # assign solution
         stress_array[ii] = stress
-        nu_prime[ii] = stress_unit[0]
-        E_prime[ii] = stress_rate_1_unit[0]
-        kernel[ii] = -stress_rate_2_unit
+            nu_prime[ii] = nu_p
+            E_prime[ii] = E_p
+            kernel[ii] = K
         strain_array[ii] = strain(t)
         strain_rate_array[ii] = strain_rate(t)
         E_array[ii] = microstructure_list[0].get_local()
