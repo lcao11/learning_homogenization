@@ -141,11 +141,20 @@ class DataNormalization(torch.nn.Module):
             mean = torch.zeros(stat_shape)
             std = torch.ones(stat_shape)
         else:
-            raise ValueError("Must provide either 'x' (data) or 'shape' to initialize DataNormalization.")
+            mean = torch.tensor(0.0)
+            std = torch.tensor(1.0)
             
         # Register as buffers so they are saved in state_dict and moved to device automatically
         self.register_buffer('mean', mean)
         self.register_buffer('std', std)
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+        # Dynamically resize buffers to match the incoming state_dict to prevent shape mismatch errors
+        for k in ['mean', 'std']:
+            key = prefix + k
+            if key in state_dict:
+                setattr(self, k, state_dict[key].clone())
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
 
     def encode(self, x):
         return (x - self.mean) / self.std

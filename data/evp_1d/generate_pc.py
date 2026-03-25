@@ -60,7 +60,7 @@ if __name__ == '__main__':
     parser.add_argument('--youngs_modulus_max',
                         default=10,
                         type=float,
-                        help="The maximum nu value")
+                        help="The maximum E value")
 
     parser.add_argument('--rate_constant_min',
                         default=0.5,
@@ -70,17 +70,17 @@ if __name__ == '__main__':
     parser.add_argument('--rate_constant_max',
                         default=1.5,
                         type=float,
-                        help="The minimum rate constant value")
+                        help="The maximum rate constant value")
     
     parser.add_argument('--rate_exponent_min',
-                        default=2,
+                        default=1,
                         type=float,
                         help="The minimum rate exponent value")
     
     parser.add_argument('--rate_exponent_max',
                         default=5,
                         type=float,
-                        help="The minimum rate exponent value")
+                        help="The maximum rate exponent value")
 
     parser.add_argument('--yield_stress_min',
                         default=0.1,
@@ -90,7 +90,7 @@ if __name__ == '__main__':
     parser.add_argument('--yield_stress_max',
                         default=1.0,
                         type=float,
-                        help="The minimum yield stress value")
+                        help="The maximum yield stress value")
 
     parser.add_argument('--trajectory_interval',
                         default=20,
